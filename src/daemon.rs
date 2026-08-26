@@ -45,22 +45,27 @@ fn parse_spec(arg: &str) -> io::Result<(String, PortMode)> {
             )
         };
 
-        let allowed = allowed_str
-            .split(',')
-            .filter(|s| !s.is_empty())
-            .map(|s| {
-                s.parse::<Vlan>()
-                    .map_err(|_| bad_spec(arg, "bad VLAN id in allowed list"))
-            })
-            .collect::<io::Result<Vec<Vlan>>>()?;
+        // An empty allowed_str means "no allowed VLANs" (fine if native is
+        // set); an empty *field* within it (a stray or trailing comma) is
+        // a likely typo, not the same thing — reject it rather than
+        // silently dropping it, since dropping it here would look like
+        // "the VLAN just isn't on this trunk" at delivery time instead of
+        // a config error at startup time.
+        let allowed = if allowed_str.is_empty() {
+            Vec::new()
+        } else {
+            allowed_str
+                .split(',')
+                .map(|s| {
+                    s.parse::<Vlan>()
+                        .map_err(|_| bad_spec(arg, "bad VLAN id in allowed list"))
+                })
+                .collect::<io::Result<Vec<Vlan>>>()?
+        };
 
-        if native.is_none() && allowed.is_empty() {
-            return Err(bad_spec(
-                arg,
-                "trunk needs a native VLAN, at least one allowed VLAN, or both",
-            ));
-        }
-
+        // PortMode::trunk itself enforces native+allowed can't both be
+        // empty — see its doc comment for why that's checked there and
+        // not just here.
         PortMode::trunk(native, allowed).map_err(|e| bad_spec(arg, &e.to_string()))?
     } else {
         let vlan: Vlan = rest.parse().map_err(|_| bad_spec(arg, "bad VLAN id"))?;

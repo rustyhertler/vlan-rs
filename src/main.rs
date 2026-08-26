@@ -13,7 +13,12 @@ async fn main() {
 async fn try_main() -> io::Result<()> {
     let specs = daemon::parse_port_specs(std::env::args().skip(1))?;
     if specs.is_empty() {
-        eprintln!("usage: vlan-rs <tap-name>:<vlan-id> [<tap-name>:<vlan-id> ...]");
+        eprintln!("usage: vlan-rs <port-spec> [<port-spec> ...]");
+        eprintln!("  <port-spec> is one of:");
+        eprintln!("    <tap-name>:<vlan-id>                        (access port)");
+        eprintln!(
+            "    <tap-name>:trunk:<native-or-->:<allowed-csv> (trunk port; '-' = no native VLAN)"
+        );
         std::process::exit(2);
     }
     daemon::run(specs).await

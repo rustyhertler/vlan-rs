@@ -5,4 +5,4 @@ mod port;
 
 pub use error::SwitchError;
 pub use forwarding::{BROADCAST, Delivery, Switch};
-pub use port::{InvalidVlan, PortId, PortMode, Vlan};
+pub use port::{InvalidVlan, PortId, PortMode, PortModeError, Vlan};

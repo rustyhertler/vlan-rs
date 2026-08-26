@@ -134,11 +134,18 @@ impl Switch {
 
     /// Builds the frame `port` should actually receive on the wire for
     /// `vlan`: untagged for an access port or a trunk's native VLAN,
-    /// 802.1Q-tagged otherwise. `None` means the frame couldn't be encoded
-    /// (an unregistered port, or the rare case where an untagged frame's
-    /// `EtherType` collides with the 802.1Q TPID — see
-    /// [`crate::frame::WriteError`]) — dropped rather than failing the
-    /// whole `forward` call over one bad target.
+    /// 802.1Q-tagged otherwise. `None` means the frame couldn't be encoded,
+    /// and is silently dropped for that one target rather than failing the
+    /// whole `forward` call over it — deliberately unlogged, since the
+    /// switch core is zero-I/O by design (see the module docs) and both
+    /// ways this can actually happen are effectively unreachable today:
+    /// `port` not being registered can't happen (every caller of this
+    /// method derives `port` from `self.ports` itself), and the
+    /// untagged/`EtherType`-0x8100 ambiguity (see
+    /// [`crate::frame::WriteError`]) needs a frame whose *inner* `EtherType`
+    /// happens to be 0x8100 — only reachable via a QinQ-shaped frame, which
+    /// is out of scope (this crate has no `QinQ` support to produce or even
+    /// recognize one).
     fn encode_for_egress(
         &self,
         port: PortId,

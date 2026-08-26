@@ -30,6 +30,30 @@ impl fmt::Display for InvalidVlan {
 
 impl std::error::Error for InvalidVlan {}
 
+/// [`PortMode::trunk`] rejected its arguments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortModeError {
+    /// A VLAN id was outside the assignable 1..=4094 range.
+    InvalidVlan(Vlan),
+    /// Neither a native VLAN nor any allowed VLAN was given — this trunk
+    /// could never carry anything.
+    EmptyTrunk,
+}
+
+impl fmt::Display for PortModeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PortModeError::InvalidVlan(vlan) => write!(f, "{}", InvalidVlan(*vlan)),
+            PortModeError::EmptyTrunk => write!(
+                f,
+                "a trunk needs a native VLAN, at least one allowed VLAN, or both"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PortModeError {}
+
 const fn is_assignable(vlan: Vlan) -> bool {
     vlan != 0 && vlan != 4095
 }
@@ -63,24 +87,30 @@ impl PortMode {
 
     /// `allowed` may be empty if `native` is set (an untagged-only trunk,
     /// unusual but not invalid) — but not both, since that port would carry
-    /// nothing at all.
+    /// nothing at all; enforced here, not just by callers, so no caller
+    /// (the CLI today, phase 5's TOML config loader tomorrow) can construct
+    /// a structurally-useless trunk by skipping its own check.
     ///
     /// # Errors
     ///
-    /// Returns [`InvalidVlan`] if `native` or any VLAN in `allowed` is
-    /// outside 1..=4094.
+    /// Returns [`PortModeError::InvalidVlan`] if `native` or any VLAN in
+    /// `allowed` is outside 1..=4094, or [`PortModeError::EmptyTrunk`] if
+    /// both `native` and `allowed` are empty.
     pub fn trunk(
         native: Option<Vlan>,
         allowed: impl IntoIterator<Item = Vlan>,
-    ) -> Result<Self, InvalidVlan> {
+    ) -> Result<Self, PortModeError> {
         if let Some(v) = native
             && !is_assignable(v)
         {
-            return Err(InvalidVlan(v));
+            return Err(PortModeError::InvalidVlan(v));
         }
         let allowed: HashSet<Vlan> = allowed.into_iter().collect();
         if let Some(&v) = allowed.iter().find(|&&v| !is_assignable(v)) {
-            return Err(InvalidVlan(v));
+            return Err(PortModeError::InvalidVlan(v));
+        }
+        if native.is_none() && allowed.is_empty() {
+            return Err(PortModeError::EmptyTrunk);
         }
         Ok(PortMode::Trunk { native, allowed })
     }

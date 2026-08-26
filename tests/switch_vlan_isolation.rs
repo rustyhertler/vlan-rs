@@ -204,6 +204,14 @@ const ACCESS10: PortId = PortId(11);
 const ACCESS20: PortId = PortId(12);
 
 #[test]
+fn port_mode_trunk_rejects_neither_native_nor_allowed() {
+    // enforced by the constructor itself, not just the CLI parser layered
+    // on top of it — a structurally-useless trunk (carries nothing) should
+    // be unconstructable by any caller, present or future
+    assert!(PortMode::trunk(None, []).is_err());
+}
+
+#[test]
 fn trunk_egress_leaves_native_vlan_untagged() {
     let mut switch = Switch::new();
     switch.add_port(ACCESS10, PortMode::access(10).unwrap());

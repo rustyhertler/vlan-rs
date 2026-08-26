@@ -54,6 +54,14 @@ fn rejects_a_trunk_with_neither_native_nor_allowed() {
 }
 
 #[test]
+fn rejects_an_empty_field_in_the_allowed_list() {
+    // a stray or trailing comma is a likely typo (e.g. a deleted VLAN id),
+    // not the same thing as an intentionally empty list
+    assert!(parse_port_specs(args(&["tap0:trunk:-:10,,20"])).is_err());
+    assert!(parse_port_specs(args(&["tap0:trunk:-:10,20,"])).is_err());
+}
+
+#[test]
 fn rejects_a_spec_with_no_colon() {
     assert!(parse_port_specs(args(&["tap0"])).is_err());
 }
