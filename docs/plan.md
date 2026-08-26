@@ -1,6 +1,6 @@
 # vlan-rs — project plan
 
-Status: Phase 3 in progress (as of 2026-08-25). This is the committed, durable version of the plan. A richer, interactively-reviewable copy is drafted locally via the `blueprint` tool during active planning rounds — this file is what gets updated once a round is finished, so it stays readable to anyone without that tool installed.
+Status: Phase 3 done, phase 4 next (as of 2026-08-26). This is the committed, durable version of the plan. A richer, interactively-reviewable copy is drafted locally via the `blueprint` tool during active planning rounds — this file is what gets updated once a round is finished, so it stays readable to anyone without that tool installed.
 
 ## Scope (assumption, ~65% confidence)
 
@@ -41,8 +41,8 @@ The switch core has no I/O dependencies — ports are just an abstraction it for
 0. **Spec & frame primer** — no code; nail down 802.1Q vocabulary.
 1. **Frame parser/builder** ✅ *done*. Hand-rolled `EthernetFrame` / `Dot1qTag`, round-trip unit tests against captured/hand-built frames. Highest-value phase — this is where the format-level bugs live.
 2. **Switch core, in-process** ✅ *done*. Channels stand in for ports; prove VLAN isolation with unit tests before touching the kernel.
-3. **Real I/O via TAP + netns** ← *current*. Tokio event loop over TAP fds; `ping` across two namespaces is the acceptance test.
-4. **Trunk ports.** Tag/untag on trunk egress/ingress, allowed-VLAN lists, native VLAN, two switches linked by a trunk.
+3. **Real I/O via TAP + netns** ✅ *done*. Tokio event loop over TAP fds; `scripts/netns-smoke-test.sh` proves `ping` across two real namespaces through the switch.
+4. **Trunk ports** ← *current*. Tag/untag on trunk egress/ingress, allowed-VLAN lists, native VLAN, two switches linked by a trunk.
 5. **Config & CLI.** TOML topology file, live reconfig, per-port/VLAN counters.
 
 Stretch, unscheduled: MAC aging, QinQ, loop guard, scripted netns test harness, small web dashboard, `cargo-fuzz` on the parser.
