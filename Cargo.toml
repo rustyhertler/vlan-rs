@@ -6,4 +6,5 @@ edition = "2024"
 [dependencies]
 
 [dev-dependencies]
+etherparse = "0.21.0"
 rusty-hook = "0.11"
