@@ -29,3 +29,11 @@ fn rejects_a_spec_with_no_colon() {
 fn rejects_a_non_numeric_vlan_id() {
     assert!(parse_port_specs(args(&["tap0:ten"])).is_err());
 }
+
+#[test]
+fn rejects_a_duplicate_tap_name() {
+    // even across different VLANs — two ports on the same physical
+    // interface would let the switch flood a frame back out where it
+    // came from
+    assert!(parse_port_specs(args(&["tap0:10", "tap0:20"])).is_err());
+}
