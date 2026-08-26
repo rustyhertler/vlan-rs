@@ -4,7 +4,7 @@ A real 802.1Q software switch in Rust — parses and builds actual tagged Ethern
 
 ## Status
 
-**Phase 5 implemented** — TOML config (`--config <path.toml>`), live reload on `SIGHUP` (real TAP ports torn down/rebuilt to match an edited config, no restart), and a `SIGUSR1` counters dump. All 5 planned phases are now done; `scripts/config-reload-smoke-test.sh` covers this one, though its real-TAP portion hasn't been run in this dev environment (no `CAP_NET_ADMIN` here) — the config-loading and signal-handling logic itself was verified live with a zero-port config, which needs no privilege.
+**All 5 planned phases done.** Phase 5: TOML config (`--config <path.toml>`), live reload on `SIGHUP` (real TAP ports torn down/rebuilt to match an edited config, no restart), and a `SIGUSR1` counters dump — `scripts/config-reload-smoke-test.sh` passed. Only stretch goals (unscheduled) remain.
 
 Roadmap:
 
@@ -13,7 +13,7 @@ Roadmap:
 2. Switch core, in-process (channels as ports, prove VLAN isolation before touching the kernel) ✅
 3. Real I/O via TAP + netns (`ping` across namespaces is the acceptance test) ✅
 4. Trunk ports (tag/untag, allowed-VLAN lists, native VLAN, two switches over a trunk) ✅
-5. Config & CLI (TOML topology, live reconfig, counters) ✅ ← current
+5. Config & CLI (TOML topology, live reconfig, counters) ✅
 
 Stretch, unscheduled: MAC aging, QinQ, loop guard, scripted netns test harness, web dashboard, `cargo-fuzz` on the parser.
 

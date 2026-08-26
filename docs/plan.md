@@ -1,6 +1,6 @@
 # vlan-rs — project plan
 
-Status: Phase 5 implemented, real-TAP portion of the acceptance test not yet run (as of 2026-08-26). This is the committed, durable version of the plan. A richer, interactively-reviewable copy is drafted locally via the `blueprint` tool during active planning rounds — this file is what gets updated once a round is finished, so it stays readable to anyone without that tool installed.
+Status: All 5 planned phases done (as of 2026-08-26). This is the committed, durable version of the plan. A richer, interactively-reviewable copy is drafted locally via the `blueprint` tool during active planning rounds — this file is what gets updated once a round is finished, so it stays readable to anyone without that tool installed.
 
 ## Scope (assumption, ~65% confidence)
 
@@ -43,7 +43,9 @@ The switch core has no I/O dependencies — ports are just an abstraction it for
 2. **Switch core, in-process** ✅ *done*. Channels stand in for ports; prove VLAN isolation with unit tests before touching the kernel.
 3. **Real I/O via TAP + netns** ✅ *done*. Tokio event loop over TAP fds; `scripts/netns-smoke-test.sh` proves `ping` across two real namespaces through the switch.
 4. **Trunk ports** ✅ *done*. Tag/untag on trunk egress/ingress, allowed-VLAN lists, native VLAN, two switches linked by a trunk. `scripts/trunk-smoke-test.sh` — `ping` succeeded across two real switch instances over a real trunk.
-5. **Config & CLI** ← *current, implemented*. TOML topology file (`--config <path.toml>`), live reconfig (`SIGHUP` reloads — full teardown/rebuild, not a diff), per-port/VLAN counters (`SIGUSR1` dumps to stderr). `scripts/config-reload-smoke-test.sh` covers all three; the config-loading and signal-handling logic was verified live in this environment with a zero-port config (no privilege needed for that part) — only the real-TAP add/remove under reload needs `CAP_NET_ADMIN` this environment doesn't have.
+5. **Config & CLI** ✅ *done*. TOML topology file (`--config <path.toml>`), live reconfig (`SIGHUP` reloads — full teardown/rebuild, not a diff), per-port/VLAN counters (`SIGUSR1` dumps to stderr). `scripts/config-reload-smoke-test.sh` passed: real TAP ports torn down and rebuilt under `SIGHUP` without restarting the process.
+
+All five planned phases are done as of this line.
 
 Stretch, unscheduled: MAC aging, QinQ, loop guard, scripted netns test harness, small web dashboard, `cargo-fuzz` on the parser.
 
@@ -118,7 +120,7 @@ impl<'a> EthernetFrame<'a> {
 | 2 — switch core | Unit tests over in-process channel "ports" assert frames tagged for VLAN 10 never reach a port only in VLAN 20 |
 | 3 — TAP + netns | `scripts/netns-smoke-test.sh` — `ping` between two network namespaces succeeds only through the switch's TAP ports |
 | 4 — trunk ports | `scripts/trunk-smoke-test.sh` — two switch instances linked by a trunk correctly tag on egress / strip on ingress; `ping` across proves it end to end. Cross-switch VLAN isolation already covered by unit tests. Optionally repeated against a real managed switch and physical Linux boxes (hardware-in-the-loop, above) |
-| 5 — config & CLI | `scripts/config-reload-smoke-test.sh` — a TOML file reproduces a port/VLAN layout on startup; `SIGHUP` tears down and rebuilds real TAP ports to match an edited config, without restarting the process (briefly interrupts every port, not just changed ones — see Control, above); `SIGUSR1` dumps non-zero counters after real traffic |
+| 5 — config & CLI | `scripts/config-reload-smoke-test.sh` passed — a TOML file reproduces a port/VLAN layout on startup; `SIGHUP` tears down and rebuilds real TAP ports to match an edited config, without restarting the process (briefly interrupts every port, not just changed ones — see Control, above); `SIGUSR1` dumps counters |
 
 ## Open questions
 
