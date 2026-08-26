@@ -6,10 +6,16 @@ use crate::frame::EthernetFrame;
 /// BPDUs rather than subjecting them to normal forwarding rules.
 const PROBE_ETHERTYPE: u16 = 0x88B7;
 
-/// Locally-administered + multicast source MAC for probe frames, so the
-/// existing "never learn a multicast source" rule (see `forwarding.rs`)
-/// keeps them out of the MAC table with no special-casing needed here.
-const PROBE_SRC_PREFIX: u8 = 0x03;
+/// Locally-administered *unicast* source MAC prefix for probe frames (U/L
+/// bit set, I/G bit clear). Deliberately **not** a multicast source: real
+/// bridges — including Linux's, in `br_handle_frame()` — drop any frame
+/// whose source address has the multicast bit set as invalid
+/// (`is_valid_ether_addr`), so a multicast-sourced probe would never
+/// survive a hop across a real link and could never be detected looping
+/// back. Probes never reach MAC learning regardless (`forward` handles
+/// them before that point — see its doc comment), so there was never a
+/// need to piggyback on the "never learn a multicast source" rule here.
+const PROBE_SRC_PREFIX: u8 = 0x02;
 
 /// Generates a probe id astronomically unlikely to collide between two
 /// switch instances on the same segment — a collision would mean each

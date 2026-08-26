@@ -623,7 +623,7 @@ mod loop_guard_test_helpers {
 
     pub(super) fn build_probe_bytes(probe_id: u64) -> Vec<u8> {
         let mut src = [0u8; 6];
-        src[0] = 0x03;
+        src[0] = 0x02;
         src[1..6].copy_from_slice(&probe_id.to_be_bytes()[0..5]);
         let frame = EthernetFrame {
             dst: [0xFF; 6],
