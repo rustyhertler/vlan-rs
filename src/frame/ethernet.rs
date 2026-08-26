@@ -1,5 +1,5 @@
 use super::dot1q::Dot1qTag;
-use super::error::ParseError;
+use super::error::{ParseError, WriteError};
 
 const TPID_802_1Q: u16 = 0x8100;
 const UNTAGGED_HEADER_LEN: usize = 14; // dst(6) + src(6) + ethertype(2)
@@ -52,7 +52,22 @@ impl<'a> EthernetFrame<'a> {
         }
     }
 
-    pub fn write_into(&self, out: &mut Vec<u8>) {
+    pub fn write_into(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+        // An untagged frame whose EtherType is 0x8100 would be indistinguishable
+        // on the wire from a tagged one — parse() would read it back as tagged
+        // and misinterpret the first two payload bytes as a TCI. Real networks
+        // never assign 0x8100 as a genuine EtherType for exactly this reason.
+        if self.tag.is_none() && self.ethertype == TPID_802_1Q {
+            return Err(WriteError::AmbiguousUntaggedEtherType);
+        }
+
+        let header_len = if self.tag.is_some() {
+            TAGGED_HEADER_LEN
+        } else {
+            UNTAGGED_HEADER_LEN
+        };
+        out.reserve(header_len + self.payload.len());
+
         out.extend_from_slice(&self.dst);
         out.extend_from_slice(&self.src);
         if let Some(tag) = self.tag {
@@ -61,5 +76,6 @@ impl<'a> EthernetFrame<'a> {
         }
         out.extend_from_slice(&self.ethertype.to_be_bytes());
         out.extend_from_slice(self.payload);
+        Ok(())
     }
 }

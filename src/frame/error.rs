@@ -23,3 +23,23 @@ impl fmt::Display for ParseError {
 }
 
 impl std::error::Error for ParseError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteError {
+    /// `tag: None` with `ethertype: 0x8100` would be indistinguishable from a
+    /// tagged frame on the wire — parsing it back would misread it as tagged.
+    AmbiguousUntaggedEtherType,
+}
+
+impl fmt::Display for WriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WriteError::AmbiguousUntaggedEtherType => write!(
+                f,
+                "untagged frame can't use EtherType 0x8100 (802.1Q TPID) — parse() would misread it as tagged"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WriteError {}

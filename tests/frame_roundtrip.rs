@@ -1,4 +1,4 @@
-use vlan_rs::frame::{Dot1qTag, EthernetFrame, ParseError};
+use vlan_rs::frame::{Dot1qTag, EthernetFrame, ParseError, WriteError};
 
 /// Hand-built on the wire: broadcast dst, PCP=5/DEI=0/VID=42, EtherType
 /// 0x88B5 (IEEE local-experimental — deliberately not IPv4/ARP, so the
@@ -43,7 +43,7 @@ fn roundtrips_tagged_frame() {
         payload: &[1, 2, 3, 4],
     };
     let mut bytes = Vec::new();
-    original.write_into(&mut bytes);
+    original.write_into(&mut bytes).unwrap();
 
     let parsed = EthernetFrame::parse(&bytes).unwrap();
     assert_eq!(parsed, original);
@@ -59,11 +59,28 @@ fn roundtrips_untagged_frame() {
         payload: &[9, 9, 9],
     };
     let mut bytes = Vec::new();
-    original.write_into(&mut bytes);
+    original.write_into(&mut bytes).unwrap();
     assert_eq!(bytes.len(), 14 + original.payload.len());
 
     let parsed = EthernetFrame::parse(&bytes).unwrap();
     assert_eq!(parsed, original);
+}
+
+#[test]
+fn rejects_ambiguous_untagged_ethertype() {
+    let frame = EthernetFrame {
+        dst: [0x11; 6],
+        src: [0x22; 6],
+        tag: None,
+        ethertype: 0x8100, // the 802.1Q TPID — can't appear as a real, untagged EtherType
+        payload: &[],
+    };
+    let mut bytes = Vec::new();
+    assert_eq!(
+        frame.write_into(&mut bytes),
+        Err(WriteError::AmbiguousUntaggedEtherType)
+    );
+    assert!(bytes.is_empty());
 }
 
 #[test]
