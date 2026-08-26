@@ -17,4 +17,9 @@ impl MacTable {
     pub(crate) fn lookup(&self, vlan: Vlan, mac: [u8; 6]) -> Option<PortId> {
         self.entries.get(&(vlan, mac)).copied()
     }
+
+    /// Purges every entry learned against `port`, regardless of VLAN.
+    pub(crate) fn remove_port(&mut self, port: PortId) {
+        self.entries.retain(|_, &mut p| p != port);
+    }
 }

@@ -1,10 +1,10 @@
 use vlan_rs::frame::EthernetFrame;
-use vlan_rs::switch::{Forward, PortId, Switch, SwitchError};
+use vlan_rs::switch::{BROADCAST, Forward, PortId, Switch, SwitchError};
 
 const HOST_A: [u8; 6] = [0x00, 0x00, 0x00, 0x00, 0x00, 0x01]; // port 1, vlan 10
 const HOST_B: [u8; 6] = [0x00, 0x00, 0x00, 0x00, 0x00, 0x02]; // port 2, vlan 10
 const HOST_C: [u8; 6] = [0x00, 0x00, 0x00, 0x00, 0x00, 0x03]; // port 3, vlan 20
-const BROADCAST: [u8; 6] = [0xFF; 6];
+const MULTICAST_SRC: [u8; 6] = [0x01, 0x00, 0x5E, 0x00, 0x00, 0x01]; // I/G bit set — invalid as a source
 
 const PORT1: PortId = PortId(1);
 const PORT2: PortId = PortId(2);
@@ -83,6 +83,64 @@ fn rejects_unknown_ingress_port() {
         .forward(PortId(99), &frame(BROADCAST, HOST_A))
         .unwrap_err();
     assert_eq!(err, SwitchError::UnknownPort(PortId(99)));
+}
+
+#[test]
+fn reassigning_a_port_purges_its_stale_routes() {
+    let mut switch = two_vlans();
+    // host A is learned behind port 1, vlan 10
+    switch.forward(PORT1, &frame(BROADCAST, HOST_A)).unwrap();
+    assert_eq!(
+        switch.forward(PORT2, &frame(HOST_A, HOST_B)).unwrap(),
+        Forward::Unicast(PORT1)
+    );
+
+    // port 1 gets re-provisioned into vlan 20 — its old vlan-10 route to
+    // host A must not survive, or vlan-10 traffic could still reach it
+    switch.add_port(PORT1, 20);
+
+    let decision = switch.forward(PORT2, &frame(HOST_A, HOST_B)).unwrap();
+    assert_eq!(
+        decision,
+        Forward::Flood(vec![]),
+        "port 1 left vlan 10, so vlan 10 has no other member to flood to \
+         — and it must never resolve to port 1 again"
+    );
+}
+
+#[test]
+fn removed_port_is_unknown_and_drops_out_of_flooding() {
+    let mut switch = two_vlans();
+    switch.forward(PORT1, &frame(BROADCAST, HOST_A)).unwrap();
+
+    switch.remove_port(PORT1);
+
+    let err = switch
+        .forward(PORT1, &frame(BROADCAST, HOST_B))
+        .unwrap_err();
+    assert_eq!(err, SwitchError::UnknownPort(PORT1));
+
+    // vlan 10's only remaining member is port 2, so a flood from it has
+    // nowhere left to go
+    let decision = switch.forward(PORT2, &frame(BROADCAST, HOST_B)).unwrap();
+    assert_eq!(decision, Forward::Flood(vec![]));
+}
+
+#[test]
+fn never_learns_a_multicast_or_broadcast_source() {
+    let mut switch = two_vlans();
+    // a frame claiming to be *from* a multicast address is malformed —
+    // the switch must not treat it as a real host behind port 1
+    switch
+        .forward(PORT1, &frame(HOST_A, MULTICAST_SRC))
+        .unwrap();
+
+    // so a later frame *to* that same multicast address still floods,
+    // rather than resolving to a bogus single unicast port
+    let decision = switch
+        .forward(PORT2, &frame(MULTICAST_SRC, HOST_B))
+        .unwrap();
+    assert_eq!(decision, Forward::Flood(vec![PORT1]));
 }
 
 /// The roadmap's phase-2 acceptance criterion: prove VLAN isolation with
