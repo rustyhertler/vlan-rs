@@ -18,4 +18,3 @@ Roadmap:
 Stretch, unscheduled: MAC aging, QinQ, loop guard, scripted netns test harness, web dashboard, `cargo-fuzz` on the parser.
 
 Full design and rationale: [`docs/plan.md`](docs/plan.md).
-# vlan-rs
