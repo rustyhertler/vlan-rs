@@ -4,7 +4,7 @@ A real 802.1Q software switch in Rust — parses and builds actual tagged Ethern
 
 ## Status
 
-**Phase 4 implemented, acceptance test not yet run.** Access *and* trunk ports (tag on egress, strip/validate on ingress, allowed-VLAN lists, native VLAN) are in and unit-tested (34 tests). `scripts/trunk-smoke-test.sh` — two switch instances linked by a trunk, `ping` across — needs privileges this dev environment doesn't have; run it locally to confirm.
+**Phase 4 done** — `scripts/trunk-smoke-test.sh` passes: `ping` between two hosts through two separate `vlan-rs` switch instances linked by a real 802.1Q trunk. Access *and* trunk ports (tag on egress, strip/validate on ingress, allowed-VLAN lists, native VLAN) are in and unit-tested (36 tests). Phase 5 (config & CLI) is next.
 
 Roadmap:
 
@@ -12,8 +12,8 @@ Roadmap:
 1. Frame parser/builder ✅
 2. Switch core, in-process (channels as ports, prove VLAN isolation before touching the kernel) ✅
 3. Real I/O via TAP + netns (`ping` across namespaces is the acceptance test) ✅
-4. Trunk ports (tag/untag, allowed-VLAN lists, native VLAN, two switches over a trunk) ← current, implemented
-5. Config & CLI (TOML topology, live reconfig, counters)
+4. Trunk ports (tag/untag, allowed-VLAN lists, native VLAN, two switches over a trunk) ✅
+5. Config & CLI (TOML topology, live reconfig, counters) ← current
 
 Stretch, unscheduled: MAC aging, QinQ, loop guard, scripted netns test harness, web dashboard, `cargo-fuzz` on the parser.
 
