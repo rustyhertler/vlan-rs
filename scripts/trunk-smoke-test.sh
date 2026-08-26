@@ -36,6 +36,9 @@ BRIDGE="vlanrs-link"
 IP1="10.10.0.1"
 IP2="10.10.0.2"
 
+LOG_DIR="$(mktemp -d /tmp/vlanrs-trunk-test.XXXXXX)"
+echo "switch logs: $LOG_DIR/switch-a.log, $LOG_DIR/switch-b.log"
+
 SWITCH_A_PID=""
 SWITCH_B_PID=""
 
@@ -64,12 +67,15 @@ if [ "$(id -u)" -ne 0 ] && ! getcap "$BIN" 2>/dev/null | grep -q cap_net_admin; 
   exit 1
 fi
 
+# Each switch's output goes to its own log file rather than the shared
+# terminal — two independent processes writing concurrently to the same fd
+# interleave at the byte level, not just the line level, and are unreadable.
 echo "--- starting switch A ($TAP_A_ACCESS:10 $TAP_A_TRUNK:trunk:-:10,20) ---"
-"$BIN" "$TAP_A_ACCESS:10" "$TAP_A_TRUNK:trunk:-:10,20" &
+"$BIN" "$TAP_A_ACCESS:10" "$TAP_A_TRUNK:trunk:-:10,20" >"$LOG_DIR/switch-a.log" 2>&1 &
 SWITCH_A_PID=$!
 
 echo "--- starting switch B ($TAP_B_ACCESS:10 $TAP_B_TRUNK:trunk:-:10,20) ---"
-"$BIN" "$TAP_B_ACCESS:10" "$TAP_B_TRUNK:trunk:-:10,20" &
+"$BIN" "$TAP_B_ACCESS:10" "$TAP_B_TRUNK:trunk:-:10,20" >"$LOG_DIR/switch-b.log" 2>&1 &
 SWITCH_B_PID=$!
 
 echo "--- waiting for all four TAP devices to appear ---"
@@ -85,8 +91,21 @@ for dev in "$TAP_A_ACCESS" "$TAP_A_TRUNK" "$TAP_B_ACCESS" "$TAP_B_TRUNK"; do
   ip link show "$dev" >/dev/null 2>&1 || { echo "error: $dev never appeared" >&2; exit 1; }
 done
 
+# A live interface with IPv6 enabled spontaneously sends untagged neighbor
+# discovery / router solicitation traffic — that's the kernel, not our
+# switch, but a trunk with no native VLAN correctly rejects every one of
+# those as an untagged frame it can't place, which floods the log with
+# noise unrelated to the actual test. Disabled here, on the trunk-facing
+# interfaces and the bridge only — the access ports don't reject untagged
+# frames, so this same noise there is harmless and not worth suppressing.
+echo "--- disabling IPv6 on the trunk-facing interfaces (avoids ND/RS noise the trunk correctly, but noisily, rejects) ---"
+for dev in "$TAP_A_TRUNK" "$TAP_B_TRUNK"; do
+  sudo sysctl -qw "net.ipv6.conf.$dev.disable_ipv6=1" 2>/dev/null || true
+done
+
 echo "--- bridging the two trunk ports together (the 'wire' between the switches) ---"
 sudo ip link add name "$BRIDGE" type bridge
+sudo sysctl -qw "net.ipv6.conf.$BRIDGE.disable_ipv6=1" 2>/dev/null || true
 sudo ip link set "$TAP_A_TRUNK" master "$BRIDGE"
 sudo ip link set "$TAP_B_TRUNK" master "$BRIDGE"
 sudo ip link set "$TAP_A_TRUNK" up
