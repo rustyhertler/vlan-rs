@@ -4,17 +4,25 @@ A real 802.1Q software switch in Rust — parses and builds actual tagged Ethern
 
 ## Status
 
-**Phase 1 — frame parser/builder.** Hand-rolled `EthernetFrame` / `Dot1qTag` types, round-trip unit tests against captured/hand-built frames.
+**Phase 3 — real I/O via TAP + netns.** Tokio event loop over real TAP devices, wired into the switch core. `scripts/netns-smoke-test.sh` is the acceptance test: `ping` between two network namespaces connected only through the switch.
 
 Roadmap:
 
 0. Spec & frame primer (no code)
-1. Frame parser/builder ← current
-2. Switch core, in-process (channels as ports, prove VLAN isolation before touching the kernel)
-3. Real I/O via TAP + netns (`ping` across namespaces is the acceptance test)
+1. Frame parser/builder ✅
+2. Switch core, in-process (channels as ports, prove VLAN isolation before touching the kernel) ✅
+3. Real I/O via TAP + netns (`ping` across namespaces is the acceptance test) ← current
 4. Trunk ports (tag/untag, allowed-VLAN lists, native VLAN, two switches over a trunk)
 5. Config & CLI (TOML topology, live reconfig, counters)
 
 Stretch, unscheduled: MAC aging, QinQ, loop guard, scripted netns test harness, web dashboard, `cargo-fuzz` on the parser.
 
 Full design and rationale: [`docs/plan.md`](docs/plan.md).
+
+## Try it
+
+```sh
+cargo build
+sudo setcap cap_net_admin+ep target/debug/vlan-rs   # one-time; lets it open TAP devices without sudo
+./scripts/netns-smoke-test.sh                        # needs sudo too, for netns admin — see the script's header
+```

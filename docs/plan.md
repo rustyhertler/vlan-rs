@@ -1,6 +1,6 @@
 # vlan-rs — project plan
 
-Status: Phase 1 in progress (as of 2026-08-26). This is the committed, durable version of the plan. A richer, interactively-reviewable copy is drafted locally via the `blueprint` tool during active planning rounds — this file is what gets updated once a round is finished, so it stays readable to anyone without that tool installed.
+Status: Phase 3 in progress (as of 2026-08-25). This is the committed, durable version of the plan. A richer, interactively-reviewable copy is drafted locally via the `blueprint` tool during active planning rounds — this file is what gets updated once a round is finished, so it stays readable to anyone without that tool installed.
 
 ## Scope (assumption, ~65% confidence)
 
@@ -39,9 +39,9 @@ The switch core has no I/O dependencies — ports are just an abstraction it for
 ## Roadmap
 
 0. **Spec & frame primer** — no code; nail down 802.1Q vocabulary.
-1. **Frame parser/builder** ← *current*. Hand-rolled `EthernetFrame` / `Dot1qTag`, round-trip unit tests against captured/hand-built frames. Highest-value phase — this is where the format-level bugs live.
-2. **Switch core, in-process.** Channels stand in for ports; prove VLAN isolation with unit tests before touching the kernel.
-3. **Real I/O via TAP + netns.** Tokio event loop over TAP fds; `ping` across two namespaces is the acceptance test.
+1. **Frame parser/builder** ✅ *done*. Hand-rolled `EthernetFrame` / `Dot1qTag`, round-trip unit tests against captured/hand-built frames. Highest-value phase — this is where the format-level bugs live.
+2. **Switch core, in-process** ✅ *done*. Channels stand in for ports; prove VLAN isolation with unit tests before touching the kernel.
+3. **Real I/O via TAP + netns** ← *current*. Tokio event loop over TAP fds; `ping` across two namespaces is the acceptance test.
 4. **Trunk ports.** Tag/untag on trunk egress/ingress, allowed-VLAN lists, native VLAN, two switches linked by a trunk.
 5. **Config & CLI.** TOML topology file, live reconfig, per-port/VLAN counters.
 
@@ -106,7 +106,7 @@ impl<'a> EthernetFrame<'a> {
 
 ## Known risks
 
-- **TAP creation needs `CAP_NET_ADMIN`.** Root vs. capability vs. wrapper script needs a decision before phase 3 starts.
+- **TAP creation needs `CAP_NET_ADMIN`.** Resolved: `sudo setcap cap_net_admin+ep target/debug/vlan-rs` once, so the switch binary itself never needs `sudo`. Namespace administration (creating netns, moving an interface into one) is a separate kernel privilege boundary that setcap on one binary can't cover — `scripts/netns-smoke-test.sh` still shells out to `sudo ip netns ...` for just that part.
 - **Scope creep toward a full switch OS** (STP, LACP, SNMP) is a real temptation once the core loop works. Deliberately out of scope.
 - **Guardrail:** hand-roll phase 1 before reaching for `etherparse`. The crate checks the hand-rolled parser; it doesn't replace the phase where the learning happens.
 
@@ -116,12 +116,15 @@ impl<'a> EthernetFrame<'a> {
 |-------|----------------------|
 | 1 — frame parser | `cargo test --test frame_roundtrip` passes against hand-built and real-captured byte arrays |
 | 2 — switch core | Unit tests over in-process channel "ports" assert frames tagged for VLAN 10 never reach a port only in VLAN 20 |
-| 3 — TAP + netns | `ping` between two network namespaces succeeds only through the switch's TAP ports |
+| 3 — TAP + netns | `scripts/netns-smoke-test.sh` — `ping` between two network namespaces succeeds only through the switch's TAP ports |
 | 4 — trunk ports | Two switch instances linked by a trunk correctly tag on egress / strip on ingress; cross-switch VLAN isolation holds. Optionally repeated against a real managed switch and physical Linux boxes (hardware-in-the-loop, above) |
 | 5 — config & CLI | A TOML topology file reproduces a given port/VLAN layout on startup; live reconfig doesn't drop in-flight traffic |
 
 ## Open questions
 
-- **Crate choice for TAP creation (phase 3):** `tun-rs` vs. `tunio` — re-check right before phase 3 starts rather than lock in now.
-- **`CAP_NET_ADMIN` handling:** root, a capability grant on the built binary, or a small setuid/wrapper script for the integration test harness? Blocks writing the netns integration tests in phase 3.
 - **Is the QinQ stretch goal worth scheduling explicitly**, or should it stay unscheduled until phases 1–5 are done?
+
+### Resolved
+
+- **Crate choice for TAP creation (phase 3):** re-checked at phase-3 start as planned. `tunio` (the plan's other candidate) is itself now dormant — last release 2022-06-26, ~96 downloads/90 days — while `tun-rs` shipped 2.8.8 on 2026-07-21 with 210k recent downloads. Went with **`tun-rs`**.
+- **`CAP_NET_ADMIN` handling:** a capability grant on the built binary (`setcap cap_net_admin+ep`) — see Known risks, above.
