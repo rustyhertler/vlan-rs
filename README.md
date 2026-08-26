@@ -4,7 +4,7 @@ A real 802.1Q software switch in Rust — parses and builds actual tagged Ethern
 
 ## Status
 
-**All 5 planned phases done.** Phase 5: TOML config (`--config <path.toml>`), live reload on `SIGHUP` (real TAP ports torn down/rebuilt to match an edited config, no restart), and a `SIGUSR1` counters dump — `scripts/config-reload-smoke-test.sh` passed. Only stretch goals (unscheduled) remain.
+**All 5 planned phases done.** Phase 5: TOML config (`--config <path.toml>`), live reload on `SIGHUP` (real TAP ports torn down/rebuilt to match an edited config, no restart), and a `SIGUSR1` counters dump — `scripts/config-reload-smoke-test.sh` passed. Now picking up stretch goals — see `docs/stretch-goals.md`.
 
 Roadmap:
 
@@ -15,9 +15,9 @@ Roadmap:
 4. Trunk ports (tag/untag, allowed-VLAN lists, native VLAN, two switches over a trunk) ✅
 5. Config & CLI (TOML topology, live reconfig, counters) ✅
 
-Stretch, unscheduled: MAC aging, QinQ, loop guard, scripted netns test harness, web dashboard, `cargo-fuzz` on the parser.
+Stretch: scripted netns test harness in CI ✅ and `cargo-fuzz` on the parser ✅. Unscheduled: MAC aging, QinQ, loop guard, small web dashboard.
 
-Full design and rationale: [`docs/plan.md`](docs/plan.md).
+Full design and rationale: [`docs/plan.md`](docs/plan.md), [`docs/stretch-goals.md`](docs/stretch-goals.md).
 
 ## Try it
 
@@ -37,3 +37,9 @@ Two ways to specify ports:
 - `--config <path.toml>` — see `scripts/config-reload-smoke-test.sh` for an example file. While running:
   `kill -HUP <pid>` reloads the file (tears down and rebuilds every port to match it);
   `kill -USR1 <pid>` dumps per-port/VLAN counters to stderr.
+
+Fuzzing the frame parser (needs nightly + `cargo install cargo-fuzz`):
+
+```sh
+cargo +nightly fuzz run parse_frame
+```

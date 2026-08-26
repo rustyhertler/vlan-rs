@@ -25,3 +25,42 @@ jobs:
       run: cargo test --verbose --locked
     - name: Check formatting
       run: cargo fmt -- --check
+
+  smoke-tests:
+    # The real acceptance tests for phases 3-5: real TAP devices, real
+    # network namespaces, a real trunk link, a real live config reload.
+    # ubuntu-latest runners have passwordless sudo and netns/bridge
+    # support, so this can run for real instead of only ever being
+    # verified by a human locally.
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: Swatinem/rust-cache@v2
+    - name: Build
+      run: cargo build --locked
+    - name: Grant CAP_NET_ADMIN
+      run: sudo setcap cap_net_admin+ep target/debug/vlan-rs
+    - name: netns smoke test (phase 3)
+      run: sudo ./scripts/netns-smoke-test.sh
+    - name: trunk smoke test (phase 4)
+      run: sudo ./scripts/trunk-smoke-test.sh
+    - name: config reload smoke test (phase 5)
+      run: sudo ./scripts/config-reload-smoke-test.sh
+
+  fuzz:
+    # Time-boxed, not full-time fuzzing — this is a smoke check that the
+    # hand-rolled parser doesn't panic on adversarial input, not a fuzzing
+    # farm. cargo-fuzz needs nightly for its sanitizer instrumentation;
+    # the pinned stable toolchain in rust-toolchain.toml is untouched.
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: Swatinem/rust-cache@v2
+    - name: Install nightly
+      run: rustup toolchain install nightly --profile minimal
+    - name: Install cargo-fuzz
+      run: cargo install cargo-fuzz
+    - name: Fuzz parse_frame for 60s
+      run: cargo +nightly fuzz run parse_frame -- -max_total_time=60
