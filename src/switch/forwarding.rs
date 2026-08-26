@@ -1,7 +1,7 @@
 use super::error::SwitchError;
 use super::mac_table::MacTable;
-use super::port::{PortId, Vlan};
-use crate::frame::EthernetFrame;
+use super::port::{PortId, PortMode, Vlan};
+use crate::frame::{Dot1qTag, EthernetFrame};
 use std::collections::HashMap;
 
 pub const BROADCAST: [u8; 6] = [0xFF; 6];
@@ -13,26 +13,22 @@ fn is_group_address(mac: [u8; 6]) -> bool {
     mac[0] & 0x01 != 0
 }
 
-/// What a switch decided to do with a frame after learning from it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Forward {
-    /// Deliver to exactly this port — the destination MAC was already learned
-    /// on a different port in the same VLAN.
-    Unicast(PortId),
-    /// Deliver to every other port in the ingress port's VLAN: destination
-    /// unknown, or broadcast. Sorted by `PortId` for deterministic output.
-    Flood(Vec<PortId>),
-    /// The destination was learned on the same port the frame arrived on —
-    /// it's already reachable there directly, so there's nothing to do.
-    Drop,
+/// A frame ready to hand to `port`'s writer, already encoded exactly as
+/// that port's mode requires — tagged for a trunk carrying a non-native
+/// VLAN, untagged for an access port or a trunk's native VLAN.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Delivery {
+    pub port: PortId,
+    pub bytes: Vec<u8>,
 }
 
-/// Phase 2's switch core: access ports only (one VLAN per port, no
-/// tag/untag), zero I/O. Ports are just handles the caller assigns meaning
-/// to — actually moving bytes per a `Forward` decision is the caller's job.
+/// The switch core: per-VLAN MAC learning, access *and* trunk ports, zero
+/// I/O. Ports are just handles the caller assigns meaning to — actually
+/// moving bytes per the `Delivery` list `forward` returns is the caller's
+/// job.
 #[derive(Default)]
 pub struct Switch {
-    ports: HashMap<PortId, Vlan>,
+    ports: HashMap<PortId, PortMode>,
     mac_table: MacTable,
 }
 
@@ -42,13 +38,13 @@ impl Switch {
         Self::default()
     }
 
-    /// Registers `port` in `vlan`. Calling this again for a `port` that's
-    /// already registered (e.g. to move it to a different VLAN) purges any
-    /// MAC-table entries learned against it, so a stale route can't leak
-    /// traffic into its new VLAN.
-    pub fn add_port(&mut self, port: PortId, vlan: Vlan) {
+    /// Registers `port` in `mode`. Calling this again for a `port` that's
+    /// already registered (e.g. to change its mode) purges any MAC-table
+    /// entries learned against it, so a stale route can't leak traffic
+    /// into whatever VLANs its new mode carries.
+    pub fn add_port(&mut self, port: PortId, mode: PortMode) {
         self.mac_table.remove_port(port);
-        self.ports.insert(port, vlan);
+        self.ports.insert(port, mode);
     }
 
     /// Deregisters `port` and purges its learned MAC-table entries. A later
@@ -59,22 +55,23 @@ impl Switch {
         self.mac_table.remove_port(port);
     }
 
-    /// Learns `frame`'s source MAC against `ingress`'s VLAN, then decides
-    /// where the frame goes.
+    /// Learns `frame`'s source MAC against `ingress`'s resolved VLAN, then
+    /// decides where the frame goes — returning it pre-encoded for each
+    /// egress port's mode. Empty means drop.
     ///
     /// # Errors
     ///
     /// Returns [`SwitchError::UnknownPort`] if `ingress` was never
-    /// registered via [`Switch::add_port`].
+    /// registered via [`Switch::add_port`], [`SwitchError::TaggedFrameOnAccessPort`]
+    /// if a tagged frame arrived on an access port, or a trunk-specific
+    /// error if `frame` doesn't resolve to a VLAN that trunk carries — see
+    /// [`SwitchError`].
     pub fn forward(
         &mut self,
         ingress: PortId,
         frame: &EthernetFrame,
-    ) -> Result<Forward, SwitchError> {
-        let vlan = *self
-            .ports
-            .get(&ingress)
-            .ok_or(SwitchError::UnknownPort(ingress))?;
+    ) -> Result<Vec<Delivery>, SwitchError> {
+        let vlan = self.ingress_vlan(ingress, frame)?;
 
         // A forged multicast/broadcast source is never learned — which, as a
         // side effect, also keeps a later multicast/broadcast *destination*
@@ -83,24 +80,107 @@ impl Switch {
             self.mac_table.learn(vlan, frame.src, ingress);
         }
 
-        let egress = if frame.dst == BROADCAST {
-            None
+        let egress_ports = if frame.dst == BROADCAST {
+            self.flood_targets(vlan, ingress)
         } else {
-            self.mac_table.lookup(vlan, frame.dst)
+            match self.mac_table.lookup(vlan, frame.dst) {
+                Some(egress) if egress == ingress => Vec::new(),
+                Some(egress) => vec![egress],
+                None => self.flood_targets(vlan, ingress),
+            }
         };
 
-        Ok(match egress {
-            Some(egress) if egress == ingress => Forward::Drop,
-            Some(egress) => Forward::Unicast(egress),
-            None => Forward::Flood(self.flood_targets(vlan, ingress)),
-        })
+        Ok(egress_ports
+            .into_iter()
+            .filter_map(|port| self.encode_for_egress(port, vlan, frame))
+            .collect())
+    }
+
+    /// Resolves the VLAN a frame arriving on `port` belongs to, per that
+    /// port's mode. An access port ignores the wire entirely (it's always
+    /// that one VLAN) but rejects a tagged frame outright rather than
+    /// silently accepting one — a tag there means the two ends disagree
+    /// about what kind of link this is.
+    fn ingress_vlan(&self, port: PortId, frame: &EthernetFrame) -> Result<Vlan, SwitchError> {
+        let mode = self
+            .ports
+            .get(&port)
+            .ok_or(SwitchError::UnknownPort(port))?;
+        match (mode, &frame.tag) {
+            (PortMode::Access { .. }, Some(_)) => {
+                Err(SwitchError::TaggedFrameOnAccessPort { port })
+            }
+            (PortMode::Trunk { native, allowed }, Some(tag))
+                if allowed.contains(&tag.vid) || *native == Some(tag.vid) =>
+            {
+                Ok(tag.vid)
+            }
+            (PortMode::Trunk { .. }, Some(tag)) => Err(SwitchError::VlanNotAllowedOnTrunk {
+                port,
+                vlan: tag.vid,
+            }),
+            (
+                PortMode::Access { vlan }
+                | PortMode::Trunk {
+                    native: Some(vlan), ..
+                },
+                None,
+            ) => Ok(*vlan),
+            (PortMode::Trunk { native: None, .. }, None) => {
+                Err(SwitchError::UntaggedFrameOnTrunkWithoutNative { port })
+            }
+        }
+    }
+
+    /// Builds the frame `port` should actually receive on the wire for
+    /// `vlan`: untagged for an access port or a trunk's native VLAN,
+    /// 802.1Q-tagged otherwise. `None` means the frame couldn't be encoded,
+    /// and is silently dropped for that one target rather than failing the
+    /// whole `forward` call over it — deliberately unlogged, since the
+    /// switch core is zero-I/O by design (see the module docs) and both
+    /// ways this can actually happen are effectively unreachable today:
+    /// `port` not being registered can't happen (every caller of this
+    /// method derives `port` from `self.ports` itself), and the
+    /// untagged/`EtherType`-0x8100 ambiguity (see
+    /// [`crate::frame::WriteError`]) needs a frame whose *inner* `EtherType`
+    /// happens to be 0x8100 — only reachable via a QinQ-shaped frame, which
+    /// is out of scope (this crate has no `QinQ` support to produce or even
+    /// recognize one).
+    fn encode_for_egress(
+        &self,
+        port: PortId,
+        vlan: Vlan,
+        frame: &EthernetFrame,
+    ) -> Option<Delivery> {
+        let mode = self.ports.get(&port)?;
+        let tag = match mode {
+            PortMode::Access { .. } => None,
+            PortMode::Trunk { native, .. } if *native == Some(vlan) => None,
+            PortMode::Trunk { .. } => Some(Dot1qTag {
+                // Best-effort round-trip of the original priority bits when
+                // the frame already carried a tag; a sane default otherwise.
+                pcp: frame.tag.map_or(0, |t| t.pcp),
+                dei: frame.tag.is_some_and(|t| t.dei),
+                vid: vlan,
+            }),
+        };
+        let out = EthernetFrame {
+            dst: frame.dst,
+            src: frame.src,
+            tag,
+            ethertype: frame.ethertype,
+            payload: frame.payload,
+        };
+        let mut bytes = Vec::new();
+        out.write_into(&mut bytes).ok()?;
+        Some(Delivery { port, bytes })
     }
 
     fn flood_targets(&self, vlan: Vlan, exclude: PortId) -> Vec<PortId> {
         let mut targets: Vec<PortId> = self
             .ports
             .iter()
-            .filter_map(|(&id, &v)| (v == vlan && id != exclude).then_some(id))
+            .filter_map(|(&id, mode)| (id != exclude && mode.carries(vlan)).then_some(id))
             .collect();
         targets.sort_by_key(|p| p.0);
         targets

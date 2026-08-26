@@ -4,7 +4,7 @@ A real 802.1Q software switch in Rust — parses and builds actual tagged Ethern
 
 ## Status
 
-**Phase 3 done** — `scripts/netns-smoke-test.sh` passes: `ping` between two real network namespaces, connected only through a real `vlan-rs` switch over two TAP devices. Phase 4 (trunk ports) is next.
+**Phase 4 implemented, acceptance test not yet run.** Access *and* trunk ports (tag on egress, strip/validate on ingress, allowed-VLAN lists, native VLAN) are in and unit-tested (34 tests). `scripts/trunk-smoke-test.sh` — two switch instances linked by a trunk, `ping` across — needs privileges this dev environment doesn't have; run it locally to confirm.
 
 Roadmap:
 
@@ -12,7 +12,7 @@ Roadmap:
 1. Frame parser/builder ✅
 2. Switch core, in-process (channels as ports, prove VLAN isolation before touching the kernel) ✅
 3. Real I/O via TAP + netns (`ping` across namespaces is the acceptance test) ✅
-4. Trunk ports (tag/untag, allowed-VLAN lists, native VLAN, two switches over a trunk) ← current
+4. Trunk ports (tag/untag, allowed-VLAN lists, native VLAN, two switches over a trunk) ← current, implemented
 5. Config & CLI (TOML topology, live reconfig, counters)
 
 Stretch, unscheduled: MAC aging, QinQ, loop guard, scripted netns test harness, web dashboard, `cargo-fuzz` on the parser.
@@ -24,5 +24,10 @@ Full design and rationale: [`docs/plan.md`](docs/plan.md).
 ```sh
 cargo build
 sudo setcap cap_net_admin+ep target/debug/vlan-rs   # one-time; lets it open TAP devices without sudo
-./scripts/netns-smoke-test.sh                        # needs sudo too, for netns admin — see the script's header
+./scripts/netns-smoke-test.sh                        # phase 3: ping across two namespaces
+./scripts/trunk-smoke-test.sh                        # phase 4: ping across two switches linked by a trunk
 ```
+Both scripts still need `sudo` themselves, for netns/bridge admin — see each script's header.
+
+CLI port syntax: `<tap-name>:<vlan-id>` for an access port, or
+`<tap-name>:trunk:<native-vlan-or-->:<allowed-vlan-csv>` for a trunk (`-` = no native VLAN).
