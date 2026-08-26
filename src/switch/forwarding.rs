@@ -4,6 +4,7 @@ use super::mac_table::MacTable;
 use super::port::{PortId, PortMode, Vlan};
 use crate::frame::{Dot1qTag, EthernetFrame};
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 pub const BROADCAST: [u8; 6] = [0xFF; 6];
 
@@ -59,6 +60,14 @@ impl Switch {
         self.port_counters.remove(&port);
     }
 
+    /// Evicts every learned MAC entry not relearned within `max_age` of
+    /// `now` — real switches do this so a host that's moved to a different
+    /// port, or gone away, doesn't leave a stale route behind. Returns how
+    /// many entries were evicted.
+    pub fn age_out(&mut self, max_age: Duration, now: Instant) -> usize {
+        self.mac_table.evict_older_than(max_age, now)
+    }
+
     /// `port`'s frame/byte counters, or all-zero if `port` isn't registered
     /// or hasn't seen any traffic yet.
     #[must_use]
@@ -86,7 +95,9 @@ impl Switch {
 
     /// Learns `frame`'s source MAC against `ingress`'s resolved VLAN, then
     /// decides where the frame goes — returning it pre-encoded for each
-    /// egress port's mode. Empty means drop.
+    /// egress port's mode. Empty means drop. `now` timestamps the learn for
+    /// [`Switch::age_out`] — supplied by the caller rather than read
+    /// internally, so aging stays testable without real time passing.
     ///
     /// # Errors
     ///
@@ -99,6 +110,7 @@ impl Switch {
         &mut self,
         ingress: PortId,
         frame: &EthernetFrame,
+        now: Instant,
     ) -> Result<Vec<Delivery>, SwitchError> {
         let vlan = match self.ingress_vlan(ingress, frame) {
             Ok(vlan) => vlan,
@@ -120,7 +132,7 @@ impl Switch {
         // side effect, also keeps a later multicast/broadcast *destination*
         // lookup from ever matching a learned unicast entry.
         if !is_group_address(frame.src) {
-            self.mac_table.learn(vlan, frame.src, ingress);
+            self.mac_table.learn(vlan, frame.src, ingress, now);
         }
 
         let egress_ports = if frame.dst == BROADCAST {

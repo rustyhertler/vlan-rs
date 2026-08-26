@@ -1,3 +1,7 @@
+// See src/lib.rs for why: a panic here takes down the whole daemon, not
+// just one bad request.
+#![warn(clippy::unwrap_used, clippy::expect_used)]
+
 use std::io;
 use std::path::PathBuf;
 

@@ -1,5 +1,13 @@
+use std::time::Instant;
+
 use vlan_rs::frame::{Dot1qTag, EthernetFrame};
 use vlan_rs::switch::{BROADCAST, Counters, Delivery, PortId, PortMode, Switch, SwitchError};
+
+/// Most tests don't care about actual timing — `Instant::now()` is a valid
+/// `now` for any `forward()` call that isn't specifically testing aging.
+fn now() -> Instant {
+    Instant::now()
+}
 
 const HOST_A: [u8; 6] = [0x00, 0x00, 0x00, 0x00, 0x00, 0x01]; // port 1, vlan 10
 const HOST_B: [u8; 6] = [0x00, 0x00, 0x00, 0x00, 0x00, 0x02]; // port 2, vlan 10
@@ -52,7 +60,9 @@ fn two_vlans() -> Switch {
 #[test]
 fn floods_broadcast_only_within_ingress_vlan() {
     let mut switch = two_vlans();
-    let deliveries = switch.forward(PORT1, &frame(BROADCAST, HOST_A)).unwrap();
+    let deliveries = switch
+        .forward(PORT1, &frame(BROADCAST, HOST_A), now())
+        .unwrap();
     assert_eq!(ports_of(&deliveries), vec![PORT2]);
 }
 
@@ -60,7 +70,9 @@ fn floods_broadcast_only_within_ingress_vlan() {
 fn floods_unknown_unicast_only_within_ingress_vlan() {
     let mut switch = two_vlans();
     // nobody has been learned yet, so an unknown dst still just floods vlan 10
-    let deliveries = switch.forward(PORT1, &frame(HOST_B, HOST_A)).unwrap();
+    let deliveries = switch
+        .forward(PORT1, &frame(HOST_B, HOST_A), now())
+        .unwrap();
     assert_eq!(ports_of(&deliveries), vec![PORT2]);
 }
 
@@ -68,9 +80,13 @@ fn floods_unknown_unicast_only_within_ingress_vlan() {
 fn delivers_unicast_once_destination_is_learned() {
     let mut switch = two_vlans();
     // host B speaks first, so the switch learns it's behind port 2
-    switch.forward(PORT2, &frame(BROADCAST, HOST_B)).unwrap();
+    switch
+        .forward(PORT2, &frame(BROADCAST, HOST_B), now())
+        .unwrap();
 
-    let deliveries = switch.forward(PORT1, &frame(HOST_B, HOST_A)).unwrap();
+    let deliveries = switch
+        .forward(PORT1, &frame(HOST_B, HOST_A), now())
+        .unwrap();
     assert_eq!(ports_of(&deliveries), vec![PORT2]);
 }
 
@@ -78,21 +94,29 @@ fn delivers_unicast_once_destination_is_learned() {
 fn same_mac_in_different_vlans_never_crosses_vlans() {
     let mut switch = two_vlans();
     // host C, on the vlan-20 port, is learned there
-    switch.forward(PORT3, &frame(BROADCAST, HOST_C)).unwrap();
+    switch
+        .forward(PORT3, &frame(BROADCAST, HOST_C), now())
+        .unwrap();
 
     // vlan 10 has never seen host C's MAC — the (vlan, mac) key keeps it
     // that way — so a vlan-10 port targeting it must still flood *within
     // vlan 10*, and can never resolve to port 3.
-    let deliveries = switch.forward(PORT1, &frame(HOST_C, HOST_A)).unwrap();
+    let deliveries = switch
+        .forward(PORT1, &frame(HOST_C, HOST_A), now())
+        .unwrap();
     assert_eq!(ports_of(&deliveries), vec![PORT2]);
 }
 
 #[test]
 fn drops_when_destination_learned_on_ingress_port() {
     let mut switch = two_vlans();
-    switch.forward(PORT1, &frame(BROADCAST, HOST_A)).unwrap();
+    switch
+        .forward(PORT1, &frame(BROADCAST, HOST_A), now())
+        .unwrap();
 
-    let deliveries = switch.forward(PORT1, &frame(HOST_A, HOST_A)).unwrap();
+    let deliveries = switch
+        .forward(PORT1, &frame(HOST_A, HOST_A), now())
+        .unwrap();
     assert!(deliveries.is_empty());
 }
 
@@ -100,7 +124,7 @@ fn drops_when_destination_learned_on_ingress_port() {
 fn rejects_unknown_ingress_port() {
     let mut switch = two_vlans();
     let err = switch
-        .forward(PortId(99), &frame(BROADCAST, HOST_A))
+        .forward(PortId(99), &frame(BROADCAST, HOST_A), now())
         .unwrap_err();
     assert_eq!(err, SwitchError::UnknownPort(PortId(99)));
 }
@@ -109,9 +133,15 @@ fn rejects_unknown_ingress_port() {
 fn reassigning_a_port_purges_its_stale_routes() {
     let mut switch = two_vlans();
     // host A is learned behind port 1, vlan 10
-    switch.forward(PORT1, &frame(BROADCAST, HOST_A)).unwrap();
+    switch
+        .forward(PORT1, &frame(BROADCAST, HOST_A), now())
+        .unwrap();
     assert_eq!(
-        ports_of(&switch.forward(PORT2, &frame(HOST_A, HOST_B)).unwrap()),
+        ports_of(
+            &switch
+                .forward(PORT2, &frame(HOST_A, HOST_B), now())
+                .unwrap()
+        ),
         vec![PORT1]
     );
 
@@ -119,7 +149,9 @@ fn reassigning_a_port_purges_its_stale_routes() {
     // host A must not survive, or vlan-10 traffic could still reach it
     switch.add_port(PORT1, PortMode::access(20).unwrap());
 
-    let deliveries = switch.forward(PORT2, &frame(HOST_A, HOST_B)).unwrap();
+    let deliveries = switch
+        .forward(PORT2, &frame(HOST_A, HOST_B), now())
+        .unwrap();
     assert!(
         deliveries.is_empty(),
         "port 1 left vlan 10, so vlan 10 has no other member to flood to \
@@ -130,18 +162,22 @@ fn reassigning_a_port_purges_its_stale_routes() {
 #[test]
 fn removed_port_is_unknown_and_drops_out_of_flooding() {
     let mut switch = two_vlans();
-    switch.forward(PORT1, &frame(BROADCAST, HOST_A)).unwrap();
+    switch
+        .forward(PORT1, &frame(BROADCAST, HOST_A), now())
+        .unwrap();
 
     switch.remove_port(PORT1);
 
     let err = switch
-        .forward(PORT1, &frame(BROADCAST, HOST_B))
+        .forward(PORT1, &frame(BROADCAST, HOST_B), now())
         .unwrap_err();
     assert_eq!(err, SwitchError::UnknownPort(PORT1));
 
     // vlan 10's only remaining member is port 2, so a flood from it has
     // nowhere left to go
-    let deliveries = switch.forward(PORT2, &frame(BROADCAST, HOST_B)).unwrap();
+    let deliveries = switch
+        .forward(PORT2, &frame(BROADCAST, HOST_B), now())
+        .unwrap();
     assert!(deliveries.is_empty());
 }
 
@@ -151,13 +187,13 @@ fn never_learns_a_multicast_or_broadcast_source() {
     // a frame claiming to be *from* a multicast address is malformed —
     // the switch must not treat it as a real host behind port 1
     switch
-        .forward(PORT1, &frame(HOST_A, MULTICAST_SRC))
+        .forward(PORT1, &frame(HOST_A, MULTICAST_SRC), now())
         .unwrap();
 
     // so a later frame *to* that same multicast address still floods,
     // rather than resolving to a bogus single unicast port
     let deliveries = switch
-        .forward(PORT2, &frame(MULTICAST_SRC, HOST_B))
+        .forward(PORT2, &frame(MULTICAST_SRC, HOST_B), now())
         .unwrap();
     assert_eq!(ports_of(&deliveries), vec![PORT1]);
 }
@@ -179,7 +215,7 @@ fn vlan_isolation_over_channels() {
     frame(BROADCAST, HOST_A).write_into(&mut wire).unwrap();
 
     let parsed = EthernetFrame::parse(&wire).unwrap();
-    let deliveries = switch.forward(PORT1, &parsed).unwrap();
+    let deliveries = switch.forward(PORT1, &parsed, now()).unwrap();
     for Delivery { port, bytes } in deliveries {
         if let Some((_, tx)) = senders.iter().find(|(id, _)| *id == port) {
             tx.send(bytes).unwrap();
@@ -217,7 +253,9 @@ fn trunk_egress_leaves_native_vlan_untagged() {
     switch.add_port(ACCESS10, PortMode::access(10).unwrap());
     switch.add_port(TRUNK, PortMode::trunk(Some(10), [10, 20]).unwrap());
 
-    let deliveries = switch.forward(ACCESS10, &frame(BROADCAST, HOST_A)).unwrap();
+    let deliveries = switch
+        .forward(ACCESS10, &frame(BROADCAST, HOST_A), now())
+        .unwrap();
     let delivery = deliveries.iter().find(|d| d.port == TRUNK).unwrap();
     let out = EthernetFrame::parse(&delivery.bytes).unwrap();
     assert!(
@@ -232,7 +270,9 @@ fn trunk_egress_tags_non_native_vlan() {
     switch.add_port(ACCESS20, PortMode::access(20).unwrap());
     switch.add_port(TRUNK, PortMode::trunk(Some(10), [10, 20]).unwrap());
 
-    let deliveries = switch.forward(ACCESS20, &frame(BROADCAST, HOST_C)).unwrap();
+    let deliveries = switch
+        .forward(ACCESS20, &frame(BROADCAST, HOST_C), now())
+        .unwrap();
     let delivery = deliveries.iter().find(|d| d.port == TRUNK).unwrap();
     let out = EthernetFrame::parse(&delivery.bytes).unwrap();
     let tag = out
@@ -248,7 +288,7 @@ fn trunk_ingress_resolves_tagged_frame_to_its_vid() {
     switch.add_port(ACCESS20, PortMode::access(20).unwrap());
 
     let deliveries = switch
-        .forward(TRUNK, &tagged_frame(BROADCAST, HOST_C, 20))
+        .forward(TRUNK, &tagged_frame(BROADCAST, HOST_C, 20), now())
         .unwrap();
     assert_eq!(ports_of(&deliveries), vec![ACCESS20]);
     let out = EthernetFrame::parse(&deliveries[0].bytes).unwrap();
@@ -261,7 +301,9 @@ fn trunk_ingress_resolves_untagged_frame_to_native_vlan() {
     switch.add_port(TRUNK, PortMode::trunk(Some(10), [10, 20]).unwrap());
     switch.add_port(ACCESS10, PortMode::access(10).unwrap());
 
-    let deliveries = switch.forward(TRUNK, &frame(BROADCAST, HOST_A)).unwrap();
+    let deliveries = switch
+        .forward(TRUNK, &frame(BROADCAST, HOST_A), now())
+        .unwrap();
     assert_eq!(ports_of(&deliveries), vec![ACCESS10]);
 }
 
@@ -271,7 +313,7 @@ fn trunk_ingress_rejects_a_vlan_not_in_its_allowed_set() {
     switch.add_port(TRUNK, PortMode::trunk(Some(10), [10, 20]).unwrap());
 
     let err = switch
-        .forward(TRUNK, &tagged_frame(BROADCAST, HOST_A, 30))
+        .forward(TRUNK, &tagged_frame(BROADCAST, HOST_A, 30), now())
         .unwrap_err();
     assert_eq!(
         err,
@@ -288,7 +330,7 @@ fn trunk_ingress_rejects_untagged_without_a_native_vlan() {
     switch.add_port(TRUNK, PortMode::trunk(None, [10, 20]).unwrap());
 
     let err = switch
-        .forward(TRUNK, &frame(BROADCAST, HOST_A))
+        .forward(TRUNK, &frame(BROADCAST, HOST_A), now())
         .unwrap_err();
     assert_eq!(
         err,
@@ -302,7 +344,7 @@ fn access_port_rejects_a_tagged_frame() {
     switch.add_port(ACCESS10, PortMode::access(10).unwrap());
 
     let err = switch
-        .forward(ACCESS10, &tagged_frame(BROADCAST, HOST_A, 10))
+        .forward(ACCESS10, &tagged_frame(BROADCAST, HOST_A, 10), now())
         .unwrap_err();
     assert_eq!(err, SwitchError::TaggedFrameOnAccessPort { port: ACCESS10 });
 }
@@ -315,7 +357,7 @@ fn trunk_still_isolates_vlans() {
     switch.add_port(ACCESS20, PortMode::access(20).unwrap());
 
     let deliveries = switch
-        .forward(TRUNK, &tagged_frame(BROADCAST, HOST_C, 20))
+        .forward(TRUNK, &tagged_frame(BROADCAST, HOST_C, 20), now())
         .unwrap();
     assert_eq!(
         ports_of(&deliveries),
@@ -335,11 +377,11 @@ fn counts_frames_and_bytes_on_a_unicast_delivery() {
     // the real test frame already carrying one frame_out/bytes_out
     let seed = frame(BROADCAST, HOST_B);
     let seed_len = seed.wire_len() as u64;
-    switch.forward(PORT2, &seed).unwrap();
+    switch.forward(PORT2, &seed, now()).unwrap();
 
     let f = frame(HOST_B, HOST_A);
     let wire_len = f.wire_len() as u64;
-    switch.forward(PORT1, &f).unwrap();
+    switch.forward(PORT1, &f, now()).unwrap();
 
     let ingress = switch.port_counters(PORT1);
     assert_eq!(
@@ -365,7 +407,9 @@ fn counts_frames_and_bytes_on_a_unicast_delivery() {
 #[test]
 fn counts_every_target_of_a_flood() {
     let mut switch = two_vlans();
-    switch.forward(PORT1, &frame(BROADCAST, HOST_A)).unwrap();
+    switch
+        .forward(PORT1, &frame(BROADCAST, HOST_A), now())
+        .unwrap();
 
     // vlan 10 has ports 1 & 2; the flood delivers to port 2 only (not back
     // to the ingress port), so frames_out should be exactly 1, not 2
@@ -379,7 +423,7 @@ fn counts_a_drop_without_counting_frames_in() {
     switch.add_port(ACCESS10, PortMode::access(10).unwrap());
 
     let err = switch
-        .forward(ACCESS10, &tagged_frame(BROADCAST, HOST_A, 10))
+        .forward(ACCESS10, &tagged_frame(BROADCAST, HOST_A, 10), now())
         .unwrap_err();
     assert!(matches!(err, SwitchError::TaggedFrameOnAccessPort { .. }));
 
@@ -396,9 +440,79 @@ fn counts_a_drop_without_counting_frames_in() {
 #[test]
 fn removing_a_port_clears_its_counters() {
     let mut switch = two_vlans();
-    switch.forward(PORT1, &frame(BROADCAST, HOST_A)).unwrap();
+    switch
+        .forward(PORT1, &frame(BROADCAST, HOST_A), now())
+        .unwrap();
     assert_ne!(switch.port_counters(PORT1), Counters::default());
 
     switch.remove_port(PORT1);
     assert_eq!(switch.port_counters(PORT1), Counters::default());
+}
+
+// --- MAC aging (stretch goal) ---
+
+#[test]
+fn ages_out_stale_entries_but_keeps_fresh_ones() {
+    use std::time::Duration;
+
+    let mut switch = two_vlans();
+    let t0 = now();
+    // host A is learned behind port 1 at t0
+    switch
+        .forward(PORT1, &frame(BROADCAST, HOST_A), t0)
+        .unwrap();
+
+    let t1 = t0 + Duration::from_secs(200);
+    // host B is learned behind port 2 at t1 — still fresh at eviction time
+    switch
+        .forward(PORT2, &frame(BROADCAST, HOST_B), t1)
+        .unwrap();
+
+    // at t2, host A's entry (learned at t0, 301s ago) is stale; host B's
+    // (learned at t1, 101s ago) is not
+    let t2 = t0 + Duration::from_secs(301);
+    let evicted = switch.age_out(Duration::from_secs(300), t2);
+    assert_eq!(evicted, 1);
+
+    // host A's route is gone, so targeting it now floods instead of
+    // resolving to the port it used to be learned behind
+    let deliveries = switch.forward(PORT2, &frame(HOST_A, HOST_B), t2).unwrap();
+    assert_eq!(ports_of(&deliveries), vec![PORT1]);
+
+    // host B's route is still fresh and should still resolve directly
+    let deliveries = switch.forward(PORT1, &frame(HOST_B, HOST_A), t2).unwrap();
+    assert_eq!(ports_of(&deliveries), vec![PORT2]);
+}
+
+#[test]
+fn age_out_on_an_empty_table_evicts_nothing() {
+    use std::time::Duration;
+
+    let mut switch = two_vlans();
+    assert_eq!(switch.age_out(Duration::from_secs(300), now()), 0);
+}
+
+#[test]
+fn lookups_never_refresh_an_entrys_age() {
+    use std::time::Duration;
+
+    let mut switch = two_vlans();
+    let t0 = now();
+    // host A is learned once, at t0, and never speaks again
+    switch
+        .forward(PORT1, &frame(BROADCAST, HOST_A), t0)
+        .unwrap();
+
+    // host B repeatedly targets host A — none of these are host A
+    // *speaking*, so they must not push its last-seen time forward
+    let t1 = t0 + Duration::from_secs(100);
+    switch.forward(PORT2, &frame(HOST_A, HOST_B), t1).unwrap();
+    let t2 = t0 + Duration::from_secs(200);
+    switch.forward(PORT2, &frame(HOST_A, HOST_B), t2).unwrap();
+
+    // host A's entry is still aged from t0, not t2, so it's stale by 301s
+    // after t0 even though a lookup happened as recently as t2
+    let t3 = t0 + Duration::from_secs(301);
+    let evicted = switch.age_out(Duration::from_secs(300), t3);
+    assert_eq!(evicted, 1);
 }
