@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::fmt;
+use thiserror::Error;
 
 /// VLAN identifier. 1..=4094 are assignable; 0 means "priority-tagged, no
 /// VLAN" and 4095 is reserved — [`PortMode::access`] and
@@ -15,44 +15,23 @@ pub struct PortId(pub u32);
 
 /// `PortMode::access`/`PortMode::trunk` were given a VLAN id outside the
 /// assignable 1..=4094 range.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("invalid VLAN id {0}: must be in 1..=4094 (0 is priority-tagged-only, 4095 is reserved)")]
 pub struct InvalidVlan(pub Vlan);
 
-impl fmt::Display for InvalidVlan {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "invalid VLAN id {}: must be in 1..=4094 (0 is priority-tagged-only, 4095 is reserved)",
-            self.0
-        )
-    }
-}
-
-impl std::error::Error for InvalidVlan {}
-
 /// [`PortMode::trunk`] rejected its arguments.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum PortModeError {
     /// A VLAN id was outside the assignable 1..=4094 range.
+    #[error(
+        "invalid VLAN id {0}: must be in 1..=4094 (0 is priority-tagged-only, 4095 is reserved)"
+    )]
     InvalidVlan(Vlan),
     /// Neither a native VLAN nor any allowed VLAN was given — this trunk
     /// could never carry anything.
+    #[error("a trunk needs a native VLAN, at least one allowed VLAN, or both")]
     EmptyTrunk,
 }
-
-impl fmt::Display for PortModeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            PortModeError::InvalidVlan(vlan) => write!(f, "{}", InvalidVlan(*vlan)),
-            PortModeError::EmptyTrunk => write!(
-                f,
-                "a trunk needs a native VLAN, at least one allowed VLAN, or both"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for PortModeError {}
 
 const fn is_assignable(vlan: Vlan) -> bool {
     vlan != 0 && vlan != 4095
