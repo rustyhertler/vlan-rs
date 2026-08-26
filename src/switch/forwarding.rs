@@ -1,3 +1,4 @@
+use super::counters::Counters;
 use super::error::SwitchError;
 use super::mac_table::MacTable;
 use super::port::{PortId, PortMode, Vlan};
@@ -30,6 +31,8 @@ pub struct Delivery {
 pub struct Switch {
     ports: HashMap<PortId, PortMode>,
     mac_table: MacTable,
+    port_counters: HashMap<PortId, Counters>,
+    vlan_counters: HashMap<Vlan, Counters>,
 }
 
 impl Switch {
@@ -47,12 +50,38 @@ impl Switch {
         self.ports.insert(port, mode);
     }
 
-    /// Deregisters `port` and purges its learned MAC-table entries. A later
-    /// `forward` call using this `port` as ingress returns `UnknownPort`,
-    /// and it drops out of every VLAN's flood set.
+    /// Deregisters `port` and purges its learned MAC-table entries and
+    /// counters. A later `forward` call using this `port` as ingress
+    /// returns `UnknownPort`, and it drops out of every VLAN's flood set.
     pub fn remove_port(&mut self, port: PortId) {
         self.ports.remove(&port);
         self.mac_table.remove_port(port);
+        self.port_counters.remove(&port);
+    }
+
+    /// `port`'s frame/byte counters, or all-zero if `port` isn't registered
+    /// or hasn't seen any traffic yet.
+    #[must_use]
+    pub fn port_counters(&self, port: PortId) -> Counters {
+        self.port_counters.get(&port).copied().unwrap_or_default()
+    }
+
+    /// Every port with at least one counter update, most-recently-touched
+    /// order not guaranteed.
+    pub fn all_port_counters(&self) -> impl Iterator<Item = (PortId, Counters)> + '_ {
+        self.port_counters.iter().map(|(&p, &c)| (p, c))
+    }
+
+    /// `vlan`'s frame/byte counters, or all-zero if it's never been the
+    /// resolved VLAN of any frame `forward` has handled.
+    #[must_use]
+    pub fn vlan_counters(&self, vlan: Vlan) -> Counters {
+        self.vlan_counters.get(&vlan).copied().unwrap_or_default()
+    }
+
+    /// Every VLAN with at least one counter update.
+    pub fn all_vlan_counters(&self) -> impl Iterator<Item = (Vlan, Counters)> + '_ {
+        self.vlan_counters.iter().map(|(&v, &c)| (v, c))
     }
 
     /// Learns `frame`'s source MAC against `ingress`'s resolved VLAN, then
@@ -71,7 +100,21 @@ impl Switch {
         ingress: PortId,
         frame: &EthernetFrame,
     ) -> Result<Vec<Delivery>, SwitchError> {
-        let vlan = self.ingress_vlan(ingress, frame)?;
+        let vlan = match self.ingress_vlan(ingress, frame) {
+            Ok(vlan) => vlan,
+            Err(e) => {
+                self.port_counters.entry(ingress).or_default().drops += 1;
+                return Err(e);
+            }
+        };
+
+        let wire_len = frame.wire_len() as u64;
+        let port_in = self.port_counters.entry(ingress).or_default();
+        port_in.frames_in += 1;
+        port_in.bytes_in += wire_len;
+        let vlan_in = self.vlan_counters.entry(vlan).or_default();
+        vlan_in.frames_in += 1;
+        vlan_in.bytes_in += wire_len;
 
         // A forged multicast/broadcast source is never learned — which, as a
         // side effect, also keeps a later multicast/broadcast *destination*
@@ -90,10 +133,22 @@ impl Switch {
             }
         };
 
-        Ok(egress_ports
+        let deliveries: Vec<Delivery> = egress_ports
             .into_iter()
             .filter_map(|port| self.encode_for_egress(port, vlan, frame))
-            .collect())
+            .collect();
+
+        for delivery in &deliveries {
+            let len = delivery.bytes.len() as u64;
+            let port_out = self.port_counters.entry(delivery.port).or_default();
+            port_out.frames_out += 1;
+            port_out.bytes_out += len;
+            let vlan_out = self.vlan_counters.entry(vlan).or_default();
+            vlan_out.frames_out += 1;
+            vlan_out.bytes_out += len;
+        }
+
+        Ok(deliveries)
     }
 
     /// Resolves the VLAN a frame arriving on `port` belongs to, per that

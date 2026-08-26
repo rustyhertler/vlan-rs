@@ -67,6 +67,35 @@ fn roundtrips_untagged_frame() {
 }
 
 #[test]
+fn wire_len_matches_actual_written_length() {
+    let tagged = EthernetFrame {
+        dst: [0xAA; 6],
+        src: [0xBB; 6],
+        tag: Some(Dot1qTag {
+            pcp: 0,
+            dei: false,
+            vid: 10,
+        }),
+        ethertype: 0x0800,
+        payload: &[1, 2, 3, 4, 5],
+    };
+    let mut bytes = Vec::new();
+    tagged.write_into(&mut bytes).unwrap();
+    assert_eq!(tagged.wire_len(), bytes.len());
+
+    let untagged = EthernetFrame {
+        dst: [0x11; 6],
+        src: [0x22; 6],
+        tag: None,
+        ethertype: 0x0806,
+        payload: &[9, 9, 9],
+    };
+    let mut bytes = Vec::new();
+    untagged.write_into(&mut bytes).unwrap();
+    assert_eq!(untagged.wire_len(), bytes.len());
+}
+
+#[test]
 fn rejects_ambiguous_untagged_ethertype() {
     let frame = EthernetFrame {
         dst: [0x11; 6],

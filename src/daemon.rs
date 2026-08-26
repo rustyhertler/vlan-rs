@@ -1,9 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
+use crate::config::Config;
 use crate::frame::EthernetFrame;
 use crate::io::TapPort;
 use crate::switch::{Delivery, PortId, PortMode, Switch, Vlan};
@@ -76,8 +80,8 @@ fn parse_spec(arg: &str) -> io::Result<(String, PortMode)> {
 }
 
 /// Parses one port spec per argument — see [`parse_spec`] for the grammar.
-/// Real config (TOML, live reconfig) is phase 5 — this is just enough to
-/// stand the daemon up and prove phases 3 and 4's acceptance tests.
+/// The inline-args alternative to [`run_from_config`]'s TOML file; both
+/// end up as the same `Vec<(String, PortMode)>` [`run`] takes.
 ///
 /// # Errors
 ///
@@ -89,9 +93,13 @@ pub fn parse_port_specs(args: impl Iterator<Item = String>) -> io::Result<Vec<(S
     let specs: Vec<(String, PortMode)> = args
         .map(|arg| parse_spec(&arg))
         .collect::<io::Result<_>>()?;
+    reject_duplicate_names(&specs)?;
+    Ok(specs)
+}
 
+fn reject_duplicate_names(specs: &[(String, PortMode)]) -> io::Result<()> {
     let mut seen = HashSet::new();
-    for (name, _) in &specs {
+    for (name, _) in specs {
         if !seen.insert(name.as_str()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -99,8 +107,7 @@ pub fn parse_port_specs(args: impl Iterator<Item = String>) -> io::Result<Vec<(S
             ));
         }
     }
-
-    Ok(specs)
+    Ok(())
 }
 
 fn describe(mode: &PortMode) -> String {
@@ -122,117 +129,278 @@ enum PortEvent {
     Down,
 }
 
-/// Sends `bytes` to `port`'s outbound queue if it still has one. Silently
-/// drops (with a log line) if the queue is full or the port is gone —
-/// there's no delivery guarantee to build on top of here, only best-effort.
-fn deliver(writers: &HashMap<PortId, mpsc::Sender<Vec<u8>>>, port: PortId, bytes: Vec<u8>) {
-    let Some(tx) = writers.get(&port) else {
+/// A running port: its reader/writer tasks (each holds its own
+/// `Arc<TapPort>` clone — that's what actually keeps the device open, not
+/// this struct). Dropping this without aborting the tasks first leaks
+/// them: the device stays open and the tasks keep running until
+/// explicitly stopped, not merely until this struct is dropped. See
+/// [`teardown_port`].
+struct PortHandle {
+    writer_tx: mpsc::Sender<Vec<u8>>,
+    reader: JoinHandle<()>,
+    writer: JoinHandle<()>,
+}
+
+/// Opens `name` as `mode`, registers it with `switch`, and spawns its
+/// reader and writer tasks.
+fn spawn_port(
+    port: PortId,
+    name: &str,
+    mode: PortMode,
+    switch: &mut Switch,
+    event_tx: mpsc::UnboundedSender<(PortId, PortEvent)>,
+) -> io::Result<PortHandle> {
+    let mode_desc = describe(&mode);
+    let tap = Arc::new(TapPort::open(name)?);
+    switch.add_port(port, mode);
+    eprintln!("{port:?}: {} ({mode_desc})", tap.name()?);
+
+    // Writer task: this port's outbound queue, drained onto the TAP device.
+    let (writer_tx, mut rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_QUEUE_DEPTH);
+    let writer_tap = Arc::clone(&tap);
+    let writer = tokio::spawn(async move {
+        while let Some(bytes) = rx.recv().await {
+            match writer_tap.send(&bytes).await {
+                Ok(n) if n == bytes.len() => {}
+                Ok(n) => eprintln!("{port:?}: short write: sent {n} of {} bytes", bytes.len()),
+                Err(e) => eprintln!("{port:?}: send error: {e}"),
+            }
+        }
+    });
+
+    // Reader task: every frame this port sees goes into the shared queue
+    // the forwarding loop drains; a closed or errored device sends one
+    // `Down` event so the forwarding loop can excise the port.
+    let reader_tap = Arc::clone(&tap);
+    let reader = tokio::spawn(async move {
+        loop {
+            match reader_tap.recv().await {
+                Ok(bytes) if bytes.is_empty() => {
+                    eprintln!("{port:?}: device closed");
+                    let _ = event_tx.send((port, PortEvent::Down));
+                    break;
+                }
+                Ok(bytes) => {
+                    if event_tx.send((port, PortEvent::Frame(bytes))).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("{port:?}: recv error: {e}");
+                    let _ = event_tx.send((port, PortEvent::Down));
+                    break;
+                }
+            }
+        }
+    });
+
+    Ok(PortHandle {
+        writer_tx,
+        reader,
+        writer,
+    })
+}
+
+/// Aborts `handle`'s reader and writer tasks and waits for them to
+/// actually finish before returning, so by the time this resolves the
+/// underlying TAP device is guaranteed closed — not just requested to
+/// close. Reused during live reconfig, where a still-open old device
+/// under the same name would make the replacement's `TapPort::open` race
+/// against it; a port that's dying on its own (an errored/closed device)
+/// doesn't need this — its reader is already exiting unprompted.
+async fn teardown_port(handle: PortHandle) {
+    handle.reader.abort();
+    handle.writer.abort();
+    let _ = handle.reader.await;
+    let _ = handle.writer.await;
+}
+
+/// Sends `bytes` to `port`'s outbound queue if it's still running.
+/// Silently drops (with a log line) if the queue is full or the port is
+/// gone — there's no delivery guarantee to build on top of here, only
+/// best-effort.
+fn deliver(handles: &HashMap<PortId, PortHandle>, port: PortId, bytes: Vec<u8>) {
+    let Some(handle) = handles.get(&port) else {
         return;
     };
-    if tx.try_send(bytes).is_err() {
+    if handle.writer_tx.try_send(bytes).is_err() {
         eprintln!("{port:?}: outbound queue full, dropping frame");
     }
 }
 
+/// Loads `path` as TOML and runs [`run`] with it, keeping `path` around so
+/// `SIGHUP` can reload from the same place later.
+///
+/// # Errors
+///
+/// Returns an error if `path` can't be read or doesn't parse as a valid
+/// topology, or anything [`run`] can return.
+pub async fn run_from_config(path: PathBuf) -> io::Result<()> {
+    let specs = Config::load(&path)?.into_specs()?;
+    run(specs, Some(path)).await
+}
+
 /// Opens a TAP device per `(name, mode)` pair and runs the switch's
-/// forwarding loop. Each port gets a reader task and a writer task; a
-/// single forwarding task owns the `Switch` core and needs no locking
-/// despite every port's reader feeding it concurrently. If a port's TAP
-/// device errors out or closes, that port is deregistered from the switch
-/// and its tasks stop; the other ports keep running. Returns once every
-/// port has gone down.
+/// forwarding loop indefinitely — until the process is killed, not merely
+/// until every port has gone down, since `SIGHUP` (with `reload_path` set)
+/// can always bring new ones up. Each port gets a reader task and a writer
+/// task; the forwarding loop, `SIGHUP`, and `SIGUSR1` are all handled by
+/// one task via `select!`, so `switch` and the port table need no locking
+/// despite every port's reader feeding them concurrently.
+///
+/// `SIGHUP` reloads `reload_path` (a no-op with a log line if `None`) and
+/// does a full teardown-and-rebuild of every port — simpler than diffing
+/// against the running config, at the cost of briefly interrupting
+/// unchanged ports too. `SIGUSR1` dumps per-port and per-VLAN counters to
+/// stderr.
 ///
 /// # Errors
 ///
 /// Returns an error if a TAP device can't be opened (most commonly a
 /// missing `CAP_NET_ADMIN`) or if there are too many ports to fit a `u32`
 /// port index.
-pub async fn run(specs: Vec<(String, PortMode)>) -> io::Result<()> {
+pub async fn run(specs: Vec<(String, PortMode)>, reload_path: Option<PathBuf>) -> io::Result<()> {
     let mut switch = Switch::new();
-    let mut writers: HashMap<PortId, mpsc::Sender<Vec<u8>>> = HashMap::new();
+    let mut handles: HashMap<PortId, PortHandle> = HashMap::new();
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<(PortId, PortEvent)>();
 
     for (index, (name, mode)) in specs.into_iter().enumerate() {
-        let port_index = u32::try_from(index)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many ports"))?;
-        let port = PortId(port_index);
-        let mode_desc = describe(&mode);
-        let tap = Arc::new(TapPort::open(&name)?);
-        switch.add_port(port, mode);
-        eprintln!("{port:?}: {} ({mode_desc})", tap.name()?);
-
-        // Writer task: this port's outbound queue, drained onto the TAP device.
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_QUEUE_DEPTH);
-        writers.insert(port, tx);
-        let writer_tap = Arc::clone(&tap);
-        tokio::spawn(async move {
-            while let Some(bytes) = rx.recv().await {
-                match writer_tap.send(&bytes).await {
-                    Ok(n) if n == bytes.len() => {}
-                    Ok(n) => eprintln!("{port:?}: short write: sent {n} of {} bytes", bytes.len()),
-                    Err(e) => eprintln!("{port:?}: send error: {e}"),
-                }
-            }
-        });
-
-        // Reader task: every frame this port sees goes into the shared queue
-        // the forwarding loop below drains; a closed or errored device sends
-        // one `Down` event so the forwarding loop can excise the port.
-        let reader_tap = Arc::clone(&tap);
-        let event_tx = event_tx.clone();
-        tokio::spawn(async move {
-            loop {
-                match reader_tap.recv().await {
-                    Ok(bytes) if bytes.is_empty() => {
-                        eprintln!("{port:?}: device closed");
-                        let _ = event_tx.send((port, PortEvent::Down));
-                        break;
-                    }
-                    Ok(bytes) => {
-                        if event_tx.send((port, PortEvent::Frame(bytes))).is_err() {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("{port:?}: recv error: {e}");
-                        let _ = event_tx.send((port, PortEvent::Down));
-                        break;
-                    }
-                }
-            }
-        });
+        let port = PortId(next_port_index(index)?);
+        let handle = spawn_port(port, &name, mode, &mut switch, event_tx.clone())?;
+        handles.insert(port, handle);
     }
-    drop(event_tx);
 
-    // The forwarding loop: the only place that touches `switch`, so it needs
-    // no locking even though every port's reader task feeds it concurrently.
-    while let Some((ingress, event)) = event_rx.recv().await {
-        let bytes = match event {
-            PortEvent::Down => {
-                eprintln!("{ingress:?}: removing dead port");
-                switch.remove_port(ingress);
-                writers.remove(&ingress); // drops the sender, ending the writer task
-                continue;
-            }
-            PortEvent::Frame(bytes) => bytes,
-        };
+    let mut sighup = signal(SignalKind::hangup())?;
+    let mut sigusr1 = signal(SignalKind::user_defined1())?;
 
-        let decision = match EthernetFrame::parse(&bytes) {
-            Ok(frame) => switch.forward(ingress, &frame),
-            Err(e) => {
-                eprintln!("{ingress:?}: dropping malformed frame: {e}");
-                continue;
+    loop {
+        tokio::select! {
+            event = event_rx.recv() => {
+                let Some((ingress, event)) = event else {
+                    // Every sender (one per reader task) has dropped — can't
+                    // actually happen since senders live as long as their
+                    // task, and tasks only end after sending Down, but a
+                    // stalled loop is worse than a redundant check.
+                    continue;
+                };
+                handle_frame_event(&mut switch, &mut handles, ingress, event);
             }
-        };
-        match decision {
-            Ok(deliveries) => {
-                for Delivery { port, bytes } in deliveries {
-                    deliver(&writers, port, bytes);
-                }
+            _ = sighup.recv() => {
+                reload(&mut switch, &mut handles, reload_path.as_ref(), &event_tx).await;
             }
-            Err(e) => eprintln!("{ingress:?}: {e}"),
+            _ = sigusr1.recv() => {
+                dump_counters(&switch);
+            }
         }
     }
+}
 
-    Ok(())
+fn next_port_index(index: usize) -> io::Result<u32> {
+    u32::try_from(index).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many ports"))
+}
+
+fn handle_frame_event(
+    switch: &mut Switch,
+    handles: &mut HashMap<PortId, PortHandle>,
+    ingress: PortId,
+    event: PortEvent,
+) {
+    let bytes = match event {
+        PortEvent::Down => {
+            eprintln!("{ingress:?}: removing dead port");
+            switch.remove_port(ingress);
+            // The reader that sent this is already exiting on its own;
+            // just drop our references. Dropping writer_tx ends the
+            // writer task once its queue drains.
+            handles.remove(&ingress);
+            return;
+        }
+        PortEvent::Frame(bytes) => bytes,
+    };
+
+    let decision = match EthernetFrame::parse(&bytes) {
+        Ok(frame) => switch.forward(ingress, &frame),
+        Err(e) => {
+            eprintln!("{ingress:?}: dropping malformed frame: {e}");
+            return;
+        }
+    };
+    match decision {
+        Ok(deliveries) => {
+            for Delivery { port, bytes } in deliveries {
+                deliver(handles, port, bytes);
+            }
+        }
+        Err(e) => eprintln!("{ingress:?}: {e}"),
+    }
+}
+
+async fn reload(
+    switch: &mut Switch,
+    handles: &mut HashMap<PortId, PortHandle>,
+    reload_path: Option<&PathBuf>,
+    event_tx: &mpsc::UnboundedSender<(PortId, PortEvent)>,
+) {
+    let Some(path) = reload_path else {
+        eprintln!("SIGHUP: no --config file this daemon was started from, ignoring");
+        return;
+    };
+
+    let new_specs = match Config::load(path).and_then(Config::into_specs) {
+        Ok(specs) => specs,
+        Err(e) => {
+            eprintln!("reload failed, keeping current config: {e}");
+            return;
+        }
+    };
+
+    eprintln!(
+        "reloading {} port(s) from {}",
+        new_specs.len(),
+        path.display()
+    );
+    for (_, handle) in handles.drain() {
+        teardown_port(handle).await;
+    }
+    *switch = Switch::new();
+
+    for (index, (name, mode)) in new_specs.into_iter().enumerate() {
+        let port = match next_port_index(index) {
+            Ok(i) => PortId(i),
+            Err(e) => {
+                eprintln!(
+                    "reload: {e}, stopping with {} port(s) active",
+                    handles.len()
+                );
+                break;
+            }
+        };
+        match spawn_port(port, &name, mode, switch, event_tx.clone()) {
+            Ok(handle) => {
+                handles.insert(port, handle);
+            }
+            Err(e) => eprintln!("reload: failed to open {name}: {e}"),
+        }
+    }
+    eprintln!("reload complete: {} port(s) active", handles.len());
+}
+
+fn dump_counters(switch: &Switch) {
+    eprintln!("=== vlan-rs counters ===");
+    let mut ports: Vec<_> = switch.all_port_counters().collect();
+    ports.sort_by_key(|(p, _)| p.0);
+    for (port, c) in ports {
+        eprintln!(
+            "{port:?}: in={} ({}B) out={} ({}B) drops={}",
+            c.frames_in, c.bytes_in, c.frames_out, c.bytes_out, c.drops
+        );
+    }
+    let mut vlans: Vec<_> = switch.all_vlan_counters().collect();
+    vlans.sort_by_key(|(v, _)| *v);
+    for (vlan, c) in vlans {
+        eprintln!(
+            "vlan {vlan}: in={} ({}B) out={} ({}B)",
+            c.frames_in, c.bytes_in, c.frames_out, c.bytes_out
+        );
+    }
 }

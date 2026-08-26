@@ -4,7 +4,7 @@ A real 802.1Q software switch in Rust — parses and builds actual tagged Ethern
 
 ## Status
 
-**Phase 4 done** — `scripts/trunk-smoke-test.sh` passes: `ping` between two hosts through two separate `vlan-rs` switch instances linked by a real 802.1Q trunk. Access *and* trunk ports (tag on egress, strip/validate on ingress, allowed-VLAN lists, native VLAN) are in and unit-tested (36 tests). Phase 5 (config & CLI) is next.
+**Phase 5 implemented** — TOML config (`--config <path.toml>`), live reload on `SIGHUP` (real TAP ports torn down/rebuilt to match an edited config, no restart), and a `SIGUSR1` counters dump. All 5 planned phases are now done; `scripts/config-reload-smoke-test.sh` covers this one, though its real-TAP portion hasn't been run in this dev environment (no `CAP_NET_ADMIN` here) — the config-loading and signal-handling logic itself was verified live with a zero-port config, which needs no privilege.
 
 Roadmap:
 
@@ -13,7 +13,7 @@ Roadmap:
 2. Switch core, in-process (channels as ports, prove VLAN isolation before touching the kernel) ✅
 3. Real I/O via TAP + netns (`ping` across namespaces is the acceptance test) ✅
 4. Trunk ports (tag/untag, allowed-VLAN lists, native VLAN, two switches over a trunk) ✅
-5. Config & CLI (TOML topology, live reconfig, counters) ← current
+5. Config & CLI (TOML topology, live reconfig, counters) ✅ ← current
 
 Stretch, unscheduled: MAC aging, QinQ, loop guard, scripted netns test harness, web dashboard, `cargo-fuzz` on the parser.
 
@@ -26,8 +26,14 @@ cargo build
 sudo setcap cap_net_admin+ep target/debug/vlan-rs   # one-time; lets it open TAP devices without sudo
 ./scripts/netns-smoke-test.sh                        # phase 3: ping across two namespaces
 ./scripts/trunk-smoke-test.sh                        # phase 4: ping across two switches linked by a trunk
+./scripts/config-reload-smoke-test.sh                # phase 5: TOML config + live SIGHUP reload + SIGUSR1 counters
 ```
-Both scripts still need `sudo` themselves, for netns/bridge admin — see each script's header.
+All three scripts still need `sudo` themselves, for netns/bridge admin — see each script's header.
 
-CLI port syntax: `<tap-name>:<vlan-id>` for an access port, or
-`<tap-name>:trunk:<native-vlan-or-->:<allowed-vlan-csv>` for a trunk (`-` = no native VLAN).
+Two ways to specify ports:
+
+- Inline args: `<tap-name>:<vlan-id>` for an access port, or
+  `<tap-name>:trunk:<native-vlan-or-->:<allowed-vlan-csv>` for a trunk (`-` = no native VLAN)
+- `--config <path.toml>` — see `scripts/config-reload-smoke-test.sh` for an example file. While running:
+  `kill -HUP <pid>` reloads the file (tears down and rebuilds every port to match it);
+  `kill -USR1 <pid>` dumps per-port/VLAN counters to stderr.
