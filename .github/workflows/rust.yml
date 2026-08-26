@@ -20,7 +20,7 @@ jobs:
     - name: Build
       run: cargo build --verbose --locked
     - name: Clippy
-      run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      run: cargo clippy --all-targets --all-features --locked -- -D warnings -W clippy::pedantic
     - name: Run tests
       run: cargo test --verbose --locked
     - name: Check formatting

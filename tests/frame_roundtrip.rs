@@ -1,8 +1,8 @@
 use vlan_rs::frame::{Dot1qTag, EthernetFrame, ParseError, WriteError};
 
-/// Hand-built on the wire: broadcast dst, PCP=5/DEI=0/VID=42, EtherType
+/// Hand-built on the wire: broadcast dst, PCP=5/DEI=0/VID=42, `EtherType`
 /// 0x88B5 (IEEE local-experimental — deliberately not IPv4/ARP, so the
-/// etherparse cross-check below doesn't need a well-formed IP payload).
+/// `etherparse` cross-check below doesn't need a well-formed IP payload).
 fn hand_built_tagged_frame() -> Vec<u8> {
     vec![
         0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // dst: broadcast
