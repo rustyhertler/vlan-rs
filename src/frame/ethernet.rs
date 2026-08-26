@@ -17,6 +17,18 @@ pub struct EthernetFrame<'a> {
 }
 
 impl<'a> EthernetFrame<'a> {
+    /// The number of bytes `write_into` would produce for this frame,
+    /// without actually building it — used for wire-byte counters.
+    #[must_use]
+    pub fn wire_len(&self) -> usize {
+        let header_len = if self.tag.is_some() {
+            TAGGED_HEADER_LEN
+        } else {
+            UNTAGGED_HEADER_LEN
+        };
+        header_len + self.payload.len()
+    }
+
     /// # Errors
     ///
     /// Returns [`ParseError::TooShort`] if `bytes` is shorter than a bare
@@ -71,12 +83,7 @@ impl<'a> EthernetFrame<'a> {
             return Err(WriteError::AmbiguousUntaggedEtherType);
         }
 
-        let header_len = if self.tag.is_some() {
-            TAGGED_HEADER_LEN
-        } else {
-            UNTAGGED_HEADER_LEN
-        };
-        out.reserve(header_len + self.payload.len());
+        out.reserve(self.wire_len());
 
         out.extend_from_slice(&self.dst);
         out.extend_from_slice(&self.src);

@@ -1,5 +1,5 @@
 use vlan_rs::frame::{Dot1qTag, EthernetFrame};
-use vlan_rs::switch::{BROADCAST, Delivery, PortId, PortMode, Switch, SwitchError};
+use vlan_rs::switch::{BROADCAST, Counters, Delivery, PortId, PortMode, Switch, SwitchError};
 
 const HOST_A: [u8; 6] = [0x00, 0x00, 0x00, 0x00, 0x00, 0x01]; // port 1, vlan 10
 const HOST_B: [u8; 6] = [0x00, 0x00, 0x00, 0x00, 0x00, 0x02]; // port 2, vlan 10
@@ -322,4 +322,83 @@ fn trunk_still_isolates_vlans() {
         vec![ACCESS20],
         "vlan 20 traffic on the trunk must never reach the vlan-10 access port"
     );
+}
+
+// --- Counters (phase 5) ---
+
+#[test]
+fn counts_frames_and_bytes_on_a_unicast_delivery() {
+    let mut switch = two_vlans();
+    // host B learned behind port 2 first, so the next frame resolves to a
+    // single-target unicast rather than a flood — this broadcast is itself
+    // delivered to port 1 (vlan 10's only other member), so port 1 starts
+    // the real test frame already carrying one frame_out/bytes_out
+    let seed = frame(BROADCAST, HOST_B);
+    let seed_len = seed.wire_len() as u64;
+    switch.forward(PORT2, &seed).unwrap();
+
+    let f = frame(HOST_B, HOST_A);
+    let wire_len = f.wire_len() as u64;
+    switch.forward(PORT1, &f).unwrap();
+
+    let ingress = switch.port_counters(PORT1);
+    assert_eq!(
+        ingress,
+        Counters {
+            frames_in: 1,
+            bytes_in: wire_len,
+            frames_out: 1, // from the seed broadcast, above
+            bytes_out: seed_len,
+            drops: 0,
+        }
+    );
+
+    let egress = switch.port_counters(PORT2);
+    assert_eq!(egress.frames_out, 1); // the real unicast, not the seed
+    assert_eq!(egress.bytes_out, wire_len);
+
+    let vlan10 = switch.vlan_counters(10);
+    assert_eq!(vlan10.frames_in, 2); // host B's broadcast, then host A's unicast
+    assert_eq!(vlan10.frames_out, 2); // one delivery per forward() call
+}
+
+#[test]
+fn counts_every_target_of_a_flood() {
+    let mut switch = two_vlans();
+    switch.forward(PORT1, &frame(BROADCAST, HOST_A)).unwrap();
+
+    // vlan 10 has ports 1 & 2; the flood delivers to port 2 only (not back
+    // to the ingress port), so frames_out should be exactly 1, not 2
+    assert_eq!(switch.port_counters(PORT2).frames_out, 1);
+    assert_eq!(switch.port_counters(PORT1).frames_out, 0);
+}
+
+#[test]
+fn counts_a_drop_without_counting_frames_in() {
+    let mut switch = Switch::new();
+    switch.add_port(ACCESS10, PortMode::access(10).unwrap());
+
+    let err = switch
+        .forward(ACCESS10, &tagged_frame(BROADCAST, HOST_A, 10))
+        .unwrap_err();
+    assert!(matches!(err, SwitchError::TaggedFrameOnAccessPort { .. }));
+
+    let counters = switch.port_counters(ACCESS10);
+    assert_eq!(
+        counters,
+        Counters {
+            drops: 1,
+            ..Counters::default()
+        }
+    );
+}
+
+#[test]
+fn removing_a_port_clears_its_counters() {
+    let mut switch = two_vlans();
+    switch.forward(PORT1, &frame(BROADCAST, HOST_A)).unwrap();
+    assert_ne!(switch.port_counters(PORT1), Counters::default());
+
+    switch.remove_port(PORT1);
+    assert_eq!(switch.port_counters(PORT1), Counters::default());
 }

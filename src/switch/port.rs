@@ -33,6 +33,12 @@ pub enum PortModeError {
     EmptyTrunk,
 }
 
+impl From<InvalidVlan> for PortModeError {
+    fn from(e: InvalidVlan) -> Self {
+        PortModeError::InvalidVlan(e.0)
+    }
+}
+
 const fn is_assignable(vlan: Vlan) -> bool {
     vlan != 0 && vlan != 4095
 }
