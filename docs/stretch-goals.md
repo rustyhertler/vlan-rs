@@ -1,6 +1,6 @@
 # vlan-rs — stretch goals
 
-Status: 2 of 6 done (as of 2026-08-26). This is the committed, durable version of the plan drafted interactively via the `blueprint` tool — see `docs/plan.md`'s own header for why that split exists.
+Status: 3 of 6 done (as of 2026-08-26). This is the committed, durable version of the plan drafted interactively via the `blueprint` tool — see `docs/plan.md`'s own header for why that split exists.
 
 All five planned phases (`docs/plan.md`) are done. `docs/plan.md`'s Stretch line names six unscheduled items: MAC aging, QinQ, loop guard, a scripted netns test harness, a small web dashboard, and `cargo-fuzz` on the parser. This doc sketches scope and effort for each and records what's actually been done.
 
@@ -16,9 +16,9 @@ Added a `smoke-tests` CI job (`.github/workflows/rust.yml`) that runs `scripts/n
 
 Manually verified locally: 46M+ executions in 60 seconds, zero crashes, coverage saturated quickly (75 edges).
 
-### 3. MAC aging — not started
+### 3. MAC aging ✅ done
 
-`MacTable` entries never expire — once learned, a `(Vlan, MAC)` → `PortId` mapping is permanent until that port is reassigned or removed. Real switches age out entries after ~300s of silence. Sketch: an `Entry { port, last_seen: Instant }`, `learn` stamping it, an `evict_older_than(max_age, now)` method taking an explicit clock (not reading it internally) so it stays unit-testable, and one more `tokio::select!` arm in `daemon.rs` — a `tokio::time::interval` ticking every ~30s.
+`MacTable` entries now carry `last_seen: Instant`, stamped by `learn` — supplied by the caller (`Switch::forward` takes a `now: Instant` parameter) rather than read internally, so aging stays unit-testable without real time passing. `Switch::age_out(max_age, now)` evicts anything not relearned within `max_age`; `daemon.rs` runs it from a `tokio::time::interval` every 30s (`MAC_AGE_SWEEP_INTERVAL`), evicting entries older than 300s (`MAC_MAX_AGE`) — matching real switches' default. Aging is based on *source* activity only, same as real hardware — a lookup as a destination never refreshes an entry's clock, tested explicitly (`lookups_never_refresh_an_entrys_age`).
 
 ### 4. Loop guard — not started
 
@@ -38,13 +38,13 @@ Double-tagged frames (an outer S-VLAN tag, TPID `0x88a8`, around the existing si
 |------|----------------------|
 | CI harness | `smoke-tests` job passes on a real PR |
 | `cargo-fuzz` | `fuzz` job passes (60s bounded run, zero crashes) on a real PR |
-| MAC aging | Unit test: learn a MAC, advance a fake clock past the threshold, assert the lookup now misses |
+| MAC aging | `ages_out_stale_entries_but_keeps_fresh_ones`, `lookups_never_refresh_an_entrys_age` — a fake clock advanced past the threshold, no real time passing |
 | Loop guard | Bridge a switch's two trunk ports to each other and confirm no broadcast storm / the loop gets blocked |
 | Web dashboard | Manual: curl the JSON endpoint and load the HTML page after generating traffic via a smoke test |
 | QinQ | Round-trip tests for double-tagged frames, mirroring phase 1's single-tag approach |
 
 ## Open questions
 
-- MAC aging, loop guard, web dashboard, QinQ are all unscheduled — pick up if/when there's a concrete reason to want one.
+- Loop guard, web dashboard, QinQ are still unscheduled — pick up if/when there's a concrete reason to want one.
 - Loop guard's "blocked port" state design isn't resolved here — needs its own planning round if picked up.
 - Web dashboard: hand-rolled or a real HTTP crate — the one place a new dependency would be a bigger philosophy shift than `thiserror`/`serde` were.

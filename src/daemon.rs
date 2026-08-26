@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
@@ -17,6 +18,14 @@ use crate::switch::{Delivery, PortId, PortMode, Switch, Vlan};
 /// would let one stalled peer grow memory without limit; a real switch's
 /// answer to a full egress queue is tail-drop, not unbounded buffering.
 const OUTBOUND_QUEUE_DEPTH: usize = 256;
+
+/// How long a learned MAC entry survives without being relearned — matches
+/// the ~300s default most real switches use.
+const MAC_MAX_AGE: Duration = Duration::from_secs(300);
+/// How often the aging sweep runs. Shorter than `MAC_MAX_AGE` so a stale
+/// entry doesn't linger much past its actual age-out point; long enough
+/// that the sweep itself is negligible overhead.
+const MAC_AGE_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
 fn bad_spec(arg: &str, msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, format!("{msg} in {arg:?}"))
@@ -273,6 +282,8 @@ pub async fn run(specs: Vec<(String, PortMode)>, reload_path: Option<PathBuf>) -
 
     let mut sighup = signal(SignalKind::hangup())?;
     let mut sigusr1 = signal(SignalKind::user_defined1())?;
+    let mut age_sweep = tokio::time::interval(MAC_AGE_SWEEP_INTERVAL);
+    age_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
@@ -291,6 +302,12 @@ pub async fn run(specs: Vec<(String, PortMode)>, reload_path: Option<PathBuf>) -
             }
             _ = sigusr1.recv() => {
                 dump_counters(&switch);
+            }
+            _ = age_sweep.tick() => {
+                let evicted = switch.age_out(MAC_MAX_AGE, Instant::now());
+                if evicted > 0 {
+                    eprintln!("aged out {evicted} stale MAC table entr{}", if evicted == 1 { "y" } else { "ies" });
+                }
             }
         }
     }
@@ -341,7 +358,7 @@ fn handle_frame_event(
     };
 
     let decision = match EthernetFrame::parse(&bytes) {
-        Ok(frame) => switch.forward(ingress, &frame),
+        Ok(frame) => switch.forward(ingress, &frame, Instant::now()),
         Err(e) => {
             eprintln!("{ingress:?}: dropping malformed frame: {e}");
             return;
