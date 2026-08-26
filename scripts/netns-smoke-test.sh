@@ -17,6 +17,23 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+# `sudo ./script.sh` (as opposed to plain `./script.sh`, which only needs
+# sudo for the individual ip/netns commands below) resets PATH and often
+# $HOME, which can drop a rustup-installed cargo entirely. Fall back to the
+# invoking user's cargo env in that case.
+if ! command -v cargo >/dev/null 2>&1; then
+  real_home="${SUDO_USER:+$(getent passwd "$SUDO_USER" | cut -d: -f6)}"
+  real_home="${real_home:-$HOME}"
+  # Prepend directly rather than sourcing ~/.cargo/env — that file builds
+  # its PATH addition from $HOME, which under sudo is often root's, not
+  # the invoking user's, defeating the whole point of resolving real_home.
+  [ -d "$real_home/.cargo/bin" ] && PATH="$real_home/.cargo/bin:$PATH"
+fi
+command -v cargo >/dev/null 2>&1 || {
+  echo "error: cargo not found on PATH" >&2
+  exit 1
+}
+
 BIN="target/debug/vlan-rs"
 NS1="vlanrs-ns1"
 NS2="vlanrs-ns2"
@@ -40,7 +57,11 @@ trap cleanup EXIT
 echo "--- building ---"
 cargo build --quiet
 
-if ! getcap "$BIN" 2>/dev/null | grep -q cap_net_admin; then
+# Running this whole script as root (rather than the recommended plain
+# `./script.sh`, which relies on setcap and only needs sudo for the
+# individual ip/netns commands below) already has whatever setcap would
+# grant, so only require the capability bit when not already root.
+if [ "$(id -u)" -ne 0 ] && ! getcap "$BIN" 2>/dev/null | grep -q cap_net_admin; then
   echo "error: $BIN needs cap_net_admin. Run once:" >&2
   echo "  sudo setcap cap_net_admin+ep $BIN" >&2
   exit 1
