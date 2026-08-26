@@ -516,3 +516,124 @@ fn lookups_never_refresh_an_entrys_age() {
     let evicted = switch.age_out(Duration::from_secs(300), t3);
     assert_eq!(evicted, 1);
 }
+
+// --- Loop guard (stretch goal) ---
+
+/// Ports 1 & 2 in VLAN 10, same layout as `two_vlans`, but with a known
+/// probe id instead of a random one so a test can build a probe frame and
+/// know in advance whether `forward` will recognize it as this switch's own.
+fn two_vlans_with_probe(probe_id: u64) -> Switch {
+    let mut switch = Switch::with_probe_id(probe_id);
+    switch.add_port(PORT1, PortMode::access(10).unwrap());
+    switch.add_port(PORT2, PortMode::access(10).unwrap());
+    switch
+}
+
+#[test]
+fn a_switchs_own_probe_looping_back_blocks_the_receiving_port() {
+    let mut switch = two_vlans_with_probe(0xABCD_1234);
+    let probe = switch.build_loop_probe();
+    let parsed = EthernetFrame::parse(&probe).unwrap();
+
+    assert!(!switch.is_blocked(PORT1));
+    let deliveries = switch.forward(PORT1, &parsed, now()).unwrap();
+    assert!(
+        deliveries.is_empty(),
+        "a probe is never forwarded/flooded like regular traffic"
+    );
+    assert!(switch.is_blocked(PORT1));
+}
+
+#[test]
+fn a_different_switchs_probe_does_not_block_anything() {
+    let mut switch = two_vlans_with_probe(0xABCD_1234);
+    // built by a *different* switch instance's probe id — this is just
+    // another switch on the same segment, not a loop back to this one
+    let other_probe = loop_guard_test_helpers::build_probe_bytes(0xFFFF_0000);
+    let parsed = EthernetFrame::parse(&other_probe).unwrap();
+
+    switch.forward(PORT1, &parsed, now()).unwrap();
+    assert!(!switch.is_blocked(PORT1));
+}
+
+#[test]
+fn a_blocked_port_rejects_forward_calls() {
+    let mut switch = two_vlans_with_probe(1);
+    switch.block_port(PORT1);
+
+    let err = switch
+        .forward(PORT1, &frame(BROADCAST, HOST_A), now())
+        .unwrap_err();
+    assert_eq!(err, SwitchError::PortBlocked(PORT1));
+}
+
+#[test]
+fn a_blocked_port_is_excluded_from_flooding() {
+    let mut switch = two_vlans_with_probe(1);
+    switch.block_port(PORT2);
+
+    // port 1 is the only *unblocked* other member of vlan 10 — but it's
+    // also the ingress port here, so a broadcast from a third, freshly
+    // added port must reach neither the ingress nor the blocked port
+    switch.add_port(PORT3, PortMode::access(10).unwrap());
+    let deliveries = switch
+        .forward(PORT3, &frame(BROADCAST, HOST_C), now())
+        .unwrap();
+    assert_eq!(ports_of(&deliveries), vec![PORT1]);
+}
+
+#[test]
+fn unblock_port_restores_normal_forwarding() {
+    let mut switch = two_vlans_with_probe(1);
+    switch.block_port(PORT1);
+    switch.unblock_port(PORT1);
+
+    let deliveries = switch
+        .forward(PORT1, &frame(BROADCAST, HOST_A), now())
+        .unwrap();
+    assert_eq!(ports_of(&deliveries), vec![PORT2]);
+}
+
+#[test]
+fn re_adding_a_port_clears_a_block() {
+    let mut switch = two_vlans_with_probe(1);
+    switch.block_port(PORT1);
+
+    switch.add_port(PORT1, PortMode::access(10).unwrap());
+    assert!(!switch.is_blocked(PORT1));
+}
+
+#[test]
+fn a_probe_touches_no_counters() {
+    let mut switch = two_vlans_with_probe(0xABCD_1234);
+    let probe = switch.build_loop_probe();
+    let parsed = EthernetFrame::parse(&probe).unwrap();
+
+    switch.forward(PORT1, &parsed, now()).unwrap();
+    assert_eq!(switch.port_counters(PORT1), Counters::default());
+    assert_eq!(switch.vlan_counters(10), Counters::default());
+}
+
+/// A minimal re-implementation of `Switch::build_loop_probe`'s wire format,
+/// independent of the switch under test, so `a_different_switchs_probe_does_not_block_anything`
+/// can build "some other switch's" probe without exposing `loop_guard`'s
+/// internals outside the crate.
+mod loop_guard_test_helpers {
+    use vlan_rs::frame::EthernetFrame;
+
+    pub(super) fn build_probe_bytes(probe_id: u64) -> Vec<u8> {
+        let mut src = [0u8; 6];
+        src[0] = 0x03;
+        src[1..6].copy_from_slice(&probe_id.to_be_bytes()[0..5]);
+        let frame = EthernetFrame {
+            dst: [0xFF; 6],
+            src,
+            tag: None,
+            ethertype: 0x88B7,
+            payload: &probe_id.to_be_bytes(),
+        };
+        let mut bytes = Vec::new();
+        frame.write_into(&mut bytes).unwrap();
+        bytes
+    }
+}

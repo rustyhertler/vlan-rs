@@ -15,7 +15,7 @@ Roadmap:
 4. Trunk ports (tag/untag, allowed-VLAN lists, native VLAN, two switches over a trunk) ✅
 5. Config & CLI (TOML topology, live reconfig, counters) ✅
 
-Stretch: scripted netns test harness in CI ✅, `cargo-fuzz` on the parser ✅, MAC aging ✅. Unscheduled: QinQ, loop guard, small web dashboard.
+Stretch: scripted netns test harness in CI ✅, `cargo-fuzz` on the parser ✅, MAC aging ✅, loop guard ✅. Unscheduled: QinQ, small web dashboard.
 
 Full design and rationale: [`docs/plan.md`](docs/plan.md), [`docs/stretch-goals.md`](docs/stretch-goals.md).
 
