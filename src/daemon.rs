@@ -263,9 +263,10 @@ pub async fn run(specs: Vec<(String, PortMode)>, reload_path: Option<PathBuf>) -
     let mut switch = Switch::new();
     let mut handles: HashMap<PortId, PortHandle> = HashMap::new();
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<(PortId, PortEvent)>();
+    let mut port_ids = PortIdAllocator::default();
 
-    for (index, (name, mode)) in specs.into_iter().enumerate() {
-        let port = PortId(next_port_index(index)?);
+    for (name, mode) in specs {
+        let port = port_ids.next()?;
         let handle = spawn_port(port, &name, mode, &mut switch, event_tx.clone())?;
         handles.insert(port, handle);
     }
@@ -286,7 +287,7 @@ pub async fn run(specs: Vec<(String, PortMode)>, reload_path: Option<PathBuf>) -
                 handle_frame_event(&mut switch, &mut handles, ingress, event);
             }
             _ = sighup.recv() => {
-                reload(&mut switch, &mut handles, reload_path.as_ref(), &event_tx).await;
+                reload(&mut switch, &mut handles, reload_path.as_ref(), &event_tx, &mut port_ids).await;
             }
             _ = sigusr1.recv() => {
                 dump_counters(&switch);
@@ -295,8 +296,29 @@ pub async fn run(specs: Vec<(String, PortMode)>, reload_path: Option<PathBuf>) -
     }
 }
 
-fn next_port_index(index: usize) -> io::Result<u32> {
-    u32::try_from(index).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many ports"))
+/// Hands out `PortId`s that are never reused for the life of the process,
+/// even across a `SIGHUP` reload. `reload`'s `abort()` on a port's old
+/// tasks takes effect at their next yield point, not synchronously — one
+/// more event (worst case, a stale `Down`) can already be past the
+/// now-synchronous `UnboundedSender::send` and sitting in the channel by
+/// the time the task actually stops. Restarting numbering from 0 on every
+/// reload would let that stale event land on whatever new port reused its
+/// old id; never reusing an id means a stale event's id simply isn't in
+/// `handles` (or `switch`'s ports) any more, so it's ignored exactly like
+/// any other reference to a port that's gone — never misattributed to a
+/// different, currently-live one.
+#[derive(Default)]
+struct PortIdAllocator(u32);
+
+impl PortIdAllocator {
+    fn next(&mut self) -> io::Result<PortId> {
+        let id = self.0;
+        self.0 = self
+            .0
+            .checked_add(1)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "too many ports"))?;
+        Ok(PortId(id))
+    }
 }
 
 fn handle_frame_event(
@@ -340,22 +362,35 @@ async fn reload(
     handles: &mut HashMap<PortId, PortHandle>,
     reload_path: Option<&PathBuf>,
     event_tx: &mpsc::UnboundedSender<(PortId, PortEvent)>,
+    port_ids: &mut PortIdAllocator,
 ) {
     let Some(path) = reload_path else {
         eprintln!("SIGHUP: no --config file this daemon was started from, ignoring");
         return;
     };
 
-    let new_specs = match Config::load(path).and_then(Config::into_specs) {
-        Ok(specs) => specs,
-        Err(e) => {
+    // This task also owns frame forwarding for every port (see run's
+    // doc comment) — spawn_blocking keeps a slow read (a large file, a
+    // network filesystem) from stalling that instead of just this reload.
+    let load_path = path.clone();
+    let load_result =
+        tokio::task::spawn_blocking(move || Config::load(&load_path).and_then(Config::into_specs))
+            .await;
+    let new_specs = match load_result {
+        Ok(Ok(specs)) => specs,
+        Ok(Err(e)) => {
             eprintln!("reload failed, keeping current config: {e}");
+            return;
+        }
+        Err(join_err) => {
+            eprintln!("reload failed ({join_err}), keeping current config");
             return;
         }
     };
 
     eprintln!(
-        "reloading {} port(s) from {}",
+        "reloading {} port(s) from {} — counters and learned MAC state for every port reset, \
+         not just the ones that changed",
         new_specs.len(),
         path.display()
     );
@@ -364,9 +399,9 @@ async fn reload(
     }
     *switch = Switch::new();
 
-    for (index, (name, mode)) in new_specs.into_iter().enumerate() {
-        let port = match next_port_index(index) {
-            Ok(i) => PortId(i),
+    for (name, mode) in new_specs {
+        let port = match port_ids.next() {
+            Ok(p) => p,
             Err(e) => {
                 eprintln!(
                     "reload: {e}, stopping with {} port(s) active",
