@@ -30,6 +30,7 @@ pub struct Switch {
 }
 
 impl Switch {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -40,6 +41,11 @@ impl Switch {
 
     /// Learns `frame`'s source MAC against `ingress`'s VLAN, then decides
     /// where the frame goes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SwitchError::UnknownPort`] if `ingress` was never
+    /// registered via [`Switch::add_port`].
     pub fn forward(
         &mut self,
         ingress: PortId,

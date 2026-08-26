@@ -4,7 +4,7 @@ use std::fmt;
 pub enum ParseError {
     /// Fewer than 14 bytes: not enough for dst + src + EtherType/TPID.
     TooShort { len: usize },
-    /// TPID was 0x8100 but fewer than 18 bytes: not enough for TCI + EtherType.
+    /// TPID was 0x8100 but fewer than 18 bytes: not enough for TCI + `EtherType`.
     TruncatedTag { len: usize },
 }
 

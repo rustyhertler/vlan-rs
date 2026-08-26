@@ -6,7 +6,7 @@ const UNTAGGED_HEADER_LEN: usize = 14; // dst(6) + src(6) + ethertype(2)
 const TAGGED_HEADER_LEN: usize = 18; // dst(6) + src(6) + TPID(2) + TCI(2) + ethertype(2)
 
 /// A parsed Ethernet II frame, optionally carrying a single 802.1Q tag.
-/// QinQ (a second, outer tag) isn't represented — out of scope for phase 1.
+/// `QinQ` (a second, outer tag) isn't represented — out of scope for phase 1.
 #[derive(Debug, PartialEq, Eq)]
 pub struct EthernetFrame<'a> {
     pub dst: [u8; 6],
@@ -17,6 +17,12 @@ pub struct EthernetFrame<'a> {
 }
 
 impl<'a> EthernetFrame<'a> {
+    /// # Errors
+    ///
+    /// Returns [`ParseError::TooShort`] if `bytes` is shorter than a bare
+    /// Ethernet header, or [`ParseError::TruncatedTag`] if the TPID is
+    /// present but `bytes` is too short for the TCI and `EtherType` that
+    /// should follow it.
     pub fn parse(bytes: &'a [u8]) -> Result<Self, ParseError> {
         if bytes.len() < UNTAGGED_HEADER_LEN {
             return Err(ParseError::TooShort { len: bytes.len() });
@@ -52,6 +58,10 @@ impl<'a> EthernetFrame<'a> {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns [`WriteError::AmbiguousUntaggedEtherType`] if `self` is
+    /// untagged with `ethertype: 0x8100` — see that variant's docs.
     pub fn write_into(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
         // An untagged frame whose EtherType is 0x8100 would be indistinguishable
         // on the wire from a tagged one — parse() would read it back as tagged
