@@ -321,8 +321,15 @@ pub async fn run(specs: Vec<(String, PortMode)>, reload_path: Option<PathBuf>) -
                 // — a probe bypasses VLAN/tag processing entirely (see
                 // forward's doc comment), so it needs no per-port encoding.
                 let probe = switch.build_loop_probe();
-                for handle in handles.values() {
-                    let _ = handle.writer_tx.try_send(probe.clone());
+                for (port, handle) in &handles {
+                    // A full writer queue is exactly the condition a storm
+                    // produces — silently dropping the probe here would
+                    // discard the one frame that could end it, with no
+                    // trace of why the loop guard never fired. Logged, not
+                    // just best-effort, for that reason.
+                    if handle.writer_tx.try_send(probe.clone()).is_err() {
+                        eprintln!("{port:?}: outbound queue full, dropped loop-guard probe");
+                    }
                 }
             }
         }

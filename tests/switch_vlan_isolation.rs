@@ -552,8 +552,60 @@ fn a_different_switchs_probe_does_not_block_anything() {
     let other_probe = loop_guard_test_helpers::build_probe_bytes(0xFFFF_0000);
     let parsed = EthernetFrame::parse(&other_probe).unwrap();
 
-    switch.forward(PORT1, &parsed, now()).unwrap();
+    // Also pins down a known limitation as intentional, not a bug: a
+    // peer switch's probe is recognized-and-swallowed (Ok(vec![])), not
+    // flooded onward — so a loop spanning *two* vlan-rs switches never
+    // gets the probe back to its originator. Only a direct self-loop on
+    // one switch is detectable today; see loop_guard's module docs.
+    let deliveries = switch.forward(PORT1, &parsed, now()).unwrap();
+    assert!(deliveries.is_empty());
     assert!(!switch.is_blocked(PORT1));
+}
+
+#[test]
+fn a_zero_padded_probe_is_still_recognized() {
+    // Real hardware pads any frame under the 802.3 60-byte minimum before
+    // it goes out on the wire; `build_loop_probe` already accounts for
+    // this by padding to that minimum itself, but a peer that padded
+    // *further* (or a NIC that adds trailing garbage) must not defeat
+    // detection either — only the leading magic+id bytes matter.
+    let mut switch = two_vlans_with_probe(0xABCD_1234);
+    let probe = switch.build_loop_probe();
+    let mut padded = probe.clone();
+    padded.extend_from_slice(&[0u8; 16]);
+    let parsed = EthernetFrame::parse(&padded).unwrap();
+
+    let deliveries = switch.forward(PORT1, &parsed, now()).unwrap();
+    assert!(deliveries.is_empty());
+    assert!(switch.is_blocked(PORT1));
+}
+
+#[test]
+fn two_switches_get_different_probe_ids() {
+    let a = Switch::new();
+    let b = Switch::new();
+    assert_ne!(a.probe_id(), b.probe_id());
+}
+
+#[test]
+fn unicast_to_a_mac_learned_on_a_since_blocked_port_does_not_egress_it() {
+    let mut switch = two_vlans_with_probe(1);
+    // host A is learned on PORT1 while it's still healthy...
+    switch
+        .forward(PORT1, &frame(BROADCAST, HOST_A), now())
+        .unwrap();
+    // ...then PORT1 gets blocked (as the loop guard would do), but the
+    // stale MAC-table entry must not survive it, and even if it did,
+    // encode_for_egress must still refuse to send out a blocked port.
+    switch.block_port(PORT1);
+
+    let deliveries = switch
+        .forward(PORT2, &frame(HOST_A, HOST_B), now())
+        .unwrap();
+    assert!(
+        deliveries.is_empty(),
+        "a blocked port must receive no traffic, unicast included"
+    );
 }
 
 #[test]
@@ -614,23 +666,33 @@ fn a_probe_touches_no_counters() {
     assert_eq!(switch.vlan_counters(10), Counters::default());
 }
 
-/// A minimal re-implementation of `Switch::build_loop_probe`'s wire format,
-/// independent of the switch under test, so `a_different_switchs_probe_does_not_block_anything`
-/// can build "some other switch's" probe without exposing `loop_guard`'s
-/// internals outside the crate.
+/// A minimal re-implementation of `Switch::build_loop_probe`'s wire format
+/// — magic prefix, probe id, zero-padded to the 802.3 minimum frame size
+/// — independent of the switch under test, so
+/// `a_different_switchs_probe_does_not_block_anything` can build "some
+/// other switch's" probe without exposing `loop_guard`'s internals
+/// outside the crate. Keep in sync with `src/switch/loop_guard.rs`
+/// (`PROBE_MAGIC`, `PROBE_PAYLOAD_LEN`), the actual source of truth for
+/// this format — this copy silently drifts if that one changes.
 mod loop_guard_test_helpers {
     use vlan_rs::frame::EthernetFrame;
+
+    const PROBE_MAGIC: [u8; 4] = *b"VLPB";
+    const PROBE_PAYLOAD_LEN: usize = 46;
 
     pub(super) fn build_probe_bytes(probe_id: u64) -> Vec<u8> {
         let mut src = [0u8; 6];
         src[0] = 0x02;
         src[1..6].copy_from_slice(&probe_id.to_be_bytes()[0..5]);
+        let mut payload = [0u8; PROBE_PAYLOAD_LEN];
+        payload[0..4].copy_from_slice(&PROBE_MAGIC);
+        payload[4..12].copy_from_slice(&probe_id.to_be_bytes());
         let frame = EthernetFrame {
             dst: [0xFF; 6],
             src,
             tag: None,
             ethertype: 0x88B7,
-            payload: &probe_id.to_be_bytes(),
+            payload: &payload,
         };
         let mut bytes = Vec::new();
         frame.write_into(&mut bytes).unwrap();

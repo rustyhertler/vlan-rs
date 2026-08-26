@@ -39,9 +39,13 @@ SWITCH_PID=""
 cleanup() {
   echo "--- cleanup ---"
   [ -n "$SWITCH_PID" ] && kill "$SWITCH_PID" 2>/dev/null || true
-  ip link delete "$BRIDGE" >/dev/null 2>&1 || true
-  ip link delete "$TAP_1" >/dev/null 2>&1 || true
-  ip link delete "$TAP_2" >/dev/null 2>&1 || true
+  # setup used `sudo ip link add`/`set` (the setcap path runs as a non-root
+  # user), so a bare `ip link delete` here silently fails behind `|| true`
+  # under the same privilege model, leaving the bridge/TAPs behind for the
+  # next run to collide with ("File exists"). Match setup's privilege.
+  sudo ip link delete "$BRIDGE" >/dev/null 2>&1 || true
+  sudo ip link delete "$TAP_1" >/dev/null 2>&1 || true
+  sudo ip link delete "$TAP_2" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -60,6 +64,12 @@ SWITCH_PID=$!
 
 echo "--- waiting for both TAP devices to appear ---"
 for _ in $(seq 1 50); do
+  kill -0 "$SWITCH_PID" 2>/dev/null || {
+    echo "error: switch exited before both TAP devices appeared" >&2
+    echo "--- switch log ---" >&2
+    cat "$LOG_FILE" >&2
+    exit 1
+  }
   ip link show "$TAP_1" >/dev/null 2>&1 && ip link show "$TAP_2" >/dev/null 2>&1 && break
   sleep 0.1
 done
@@ -84,6 +94,12 @@ sudo ip link set "$BRIDGE" up
 echo "--- waiting up to 20s for the loop guard to detect and block the loop ---"
 detected=0
 for _ in $(seq 1 40); do
+  kill -0 "$SWITCH_PID" 2>/dev/null || {
+    echo "error: switch exited before the loop was detected" >&2
+    echo "--- switch log ---" >&2
+    cat "$LOG_FILE" >&2
+    exit 1
+  }
   if grep -q "loop detected" "$LOG_FILE"; then
     detected=1
     break
@@ -98,5 +114,34 @@ if [ "$detected" -ne 1 ]; then
   exit 1
 fi
 
-blocked_count="$(grep -c "loop detected" "$LOG_FILE")"
-echo "PASS: loop guard blocked $blocked_count port(s) after bridging $TAP_1 <-> $TAP_2 into a loop"
+# grep -c counts log lines, which today happens to equal the number of
+# distinct ports blocked (one "loop detected" line per port) — but that's
+# incidental, not guaranteed by the log format, so derive the port count
+# from the actual port identifiers logged rather than the line count.
+blocked_ports="$(grep -o '^PortId([0-9]*): loop detected' "$LOG_FILE" | sort -u | wc -l)"
+
+# The acceptance criterion (docs/stretch-goals.md) is "no broadcast storm",
+# not just "a log line appeared" — confirm traffic has actually plateaued,
+# not merely that detection fired once. Port counters can't tell us this:
+# a loop-guard probe never touches them even when it's *not* recognized
+# and detection has failed (see `a_probe_touches_no_counters`), so on
+# this bridge — which only ever carries probes, no real user traffic —
+# they'd read 0 whether the loop guard is working or completely broken.
+# Log growth is the real signal here: past the one-time "loop detected"
+# transition per port, steady state produces no further output, so if
+# detection had failed and the probes kept ricocheting/re-triggering,
+# the log would still be growing.
+log_lines() { wc -l <"$LOG_FILE"; }
+
+before="$(log_lines)"
+sleep 2
+after="$(log_lines)"
+
+if [ "$before" != "$after" ]; then
+  echo "FAIL: switch log still growing after blocking ($before -> $after lines) — doesn't look like a settled, blocked loop" >&2
+  echo "--- switch log ---" >&2
+  cat "$LOG_FILE" >&2
+  exit 1
+fi
+
+echo "PASS: loop guard blocked $blocked_ports port(s) after bridging $TAP_1 <-> $TAP_2 into a loop, log settled at $after lines"

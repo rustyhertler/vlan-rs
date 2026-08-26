@@ -127,9 +127,10 @@ impl Switch {
 
     /// Whether the loop guard has shut `port` down. A blocked port's
     /// `forward` calls fail with `SwitchError::PortBlocked`, and it's
-    /// excluded from every VLAN's flood set — but it still stays
-    /// registered, and still processes incoming loop-guard probes (should
-    /// a future version add automatic recovery once a loop clears).
+    /// excluded as an egress target too — both flooded and unicast
+    /// traffic (see `encode_for_egress`) — but it still stays registered,
+    /// and still processes incoming loop-guard probes (should a future
+    /// version add automatic recovery once a loop clears).
     #[must_use]
     pub fn is_blocked(&self, port: PortId) -> bool {
         self.ports.get(&port).is_some_and(|entry| entry.blocked)
@@ -138,10 +139,17 @@ impl Switch {
     /// Shuts `port` down: no traffic in or out until [`Switch::unblock_port`]
     /// or a fresh [`Switch::add_port`] call. There's no automatic recovery
     /// — this is a lightweight self-loop guard, not full spanning tree.
+    ///
+    /// Also purges `port`'s MAC-table entries, the same as
+    /// [`Switch::remove_port`] — otherwise a MAC learned on `port` before
+    /// it was blocked would keep drawing unicast traffic out through it
+    /// until the entry aged out on its own, up to [`Switch::age_out`]'s
+    /// `max_age` later, defeating "no traffic in or out" in the meantime.
     pub fn block_port(&mut self, port: PortId) {
         if let Some(entry) = self.ports.get_mut(&port) {
             entry.blocked = true;
         }
+        self.mac_table.remove_port(port);
     }
 
     /// Reverses [`Switch::block_port`].
@@ -205,6 +213,15 @@ impl Switch {
     ) -> Result<Vec<Delivery>, SwitchError> {
         if loop_guard::is_any_probe(frame) {
             return self.handle_loop_probe(ingress, frame);
+        }
+
+        let entry = self
+            .ports
+            .get(&ingress)
+            .ok_or(SwitchError::UnknownPort(ingress))?;
+        if entry.blocked {
+            self.port_counters.entry(ingress).or_default().drops += 1;
+            return Err(SwitchError::PortBlocked(ingress));
         }
 
         let vlan = match self.ingress_vlan(ingress, frame) {
@@ -277,14 +294,14 @@ impl Switch {
     /// that one VLAN) but rejects a tagged frame outright rather than
     /// silently accepting one — a tag there means the two ends disagree
     /// about what kind of link this is.
+    ///
+    /// Whether `port` is loop-guard-blocked is `forward`'s concern, not
+    /// this one — checked once, up front, before this is ever called.
     fn ingress_vlan(&self, port: PortId, frame: &EthernetFrame) -> Result<Vlan, SwitchError> {
         let entry = self
             .ports
             .get(&port)
             .ok_or(SwitchError::UnknownPort(port))?;
-        if entry.blocked {
-            return Err(SwitchError::PortBlocked(port));
-        }
         match (&entry.mode, &frame.tag) {
             (PortMode::Access { .. }, Some(_)) => {
                 Err(SwitchError::TaggedFrameOnAccessPort { port })
@@ -316,10 +333,20 @@ impl Switch {
     /// 802.1Q-tagged otherwise. `None` means the frame couldn't be encoded,
     /// and is silently dropped for that one target rather than failing the
     /// whole `forward` call over it — deliberately unlogged, since the
-    /// switch core is zero-I/O by design (see the module docs) and both
-    /// ways this can actually happen are effectively unreachable today:
-    /// `port` not being registered can't happen (every caller of this
-    /// method derives `port` from `self.ports` itself), and the
+    /// switch core is zero-I/O by design (see the module docs).
+    ///
+    /// This is also where a loop-guard-blocked *egress* port gets filtered
+    /// out — the one place that covers both the flood path (where
+    /// `flood_targets` already excludes blocked ports, making this
+    /// redundant-but-harmless there) and the unicast path (where, absent
+    /// this check, a MAC learned on a port before it was blocked would
+    /// still draw unicast frames out through it). Centralizing it here
+    /// rather than duplicating it at each call site is what makes "no
+    /// traffic in or out" of a blocked port actually hold.
+    ///
+    /// The other two ways `None` can happen are effectively unreachable
+    /// today: `port` not being registered can't happen (every caller of
+    /// this method derives `port` from `self.ports` itself), and the
     /// untagged/`EtherType`-0x8100 ambiguity (see
     /// [`crate::frame::WriteError`]) needs a frame whose *inner* `EtherType`
     /// happens to be 0x8100 — only reachable via a QinQ-shaped frame, which
@@ -331,7 +358,11 @@ impl Switch {
         vlan: Vlan,
         frame: &EthernetFrame,
     ) -> Option<Delivery> {
-        let mode = &self.ports.get(&port)?.mode;
+        let egress = self.ports.get(&port)?;
+        if egress.blocked {
+            return None;
+        }
+        let mode = &egress.mode;
         let tag = match mode {
             PortMode::Access { .. } => None,
             PortMode::Trunk { native, .. } if *native == Some(vlan) => None,
