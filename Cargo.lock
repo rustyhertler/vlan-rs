@@ -718,6 +718,7 @@ version = "0.1.0"
 dependencies = [
  "etherparse",
  "rusty-hook",
+ "thiserror",
  "tokio",
  "tun-rs",
 ]
