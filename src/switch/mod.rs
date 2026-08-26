@@ -1,6 +1,7 @@
 mod counters;
 mod error;
 mod forwarding;
+mod loop_guard;
 mod mac_table;
 mod port;
 

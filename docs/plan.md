@@ -47,7 +47,7 @@ The switch core has no I/O dependencies — ports are just an abstraction it for
 
 All five planned phases are done as of this line.
 
-Stretch: scripted netns test harness in CI ✅, `cargo-fuzz` on the parser ✅, MAC aging ✅ — see `docs/stretch-goals.md`. Unscheduled: QinQ, loop guard, small web dashboard.
+Stretch: scripted netns test harness in CI ✅, `cargo-fuzz` on the parser ✅, MAC aging ✅, loop guard ✅ (self-loops only) — see `docs/stretch-goals.md`. Unscheduled: QinQ, small web dashboard.
 
 ## Phase 1 in detail — frame parser/builder
 

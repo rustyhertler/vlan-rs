@@ -27,6 +27,11 @@ const MAC_MAX_AGE: Duration = Duration::from_secs(300);
 /// that the sweep itself is negligible overhead.
 const MAC_AGE_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
+/// How often the loop guard broadcasts its probe out every port. Much
+/// shorter than the MAC-aging sweep — containing a broadcast storm is
+/// urgent in a way aging out a stale route isn't.
+const LOOP_PROBE_INTERVAL: Duration = Duration::from_secs(5);
+
 fn bad_spec(arg: &str, msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, format!("{msg} in {arg:?}"))
 }
@@ -284,6 +289,8 @@ pub async fn run(specs: Vec<(String, PortMode)>, reload_path: Option<PathBuf>) -
     let mut sigusr1 = signal(SignalKind::user_defined1())?;
     let mut age_sweep = tokio::time::interval(MAC_AGE_SWEEP_INTERVAL);
     age_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut loop_probe = tokio::time::interval(LOOP_PROBE_INTERVAL);
+    loop_probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
@@ -307,6 +314,22 @@ pub async fn run(specs: Vec<(String, PortMode)>, reload_path: Option<PathBuf>) -
                 let evicted = switch.age_out(MAC_MAX_AGE, Instant::now());
                 if evicted > 0 {
                     eprintln!("aged out {evicted} stale MAC table entr{}", if evicted == 1 { "y" } else { "ies" });
+                }
+            }
+            _ = loop_probe.tick() => {
+                // Sent raw to every port's writer, not through Switch::forward
+                // — a probe bypasses VLAN/tag processing entirely (see
+                // forward's doc comment), so it needs no per-port encoding.
+                let probe = switch.build_loop_probe();
+                for (port, handle) in &handles {
+                    // A full writer queue is exactly the condition a storm
+                    // produces — silently dropping the probe here would
+                    // discard the one frame that could end it, with no
+                    // trace of why the loop guard never fired. Logged, not
+                    // just best-effort, for that reason.
+                    if handle.writer_tx.try_send(probe.clone()).is_err() {
+                        eprintln!("{port:?}: outbound queue full, dropped loop-guard probe");
+                    }
                 }
             }
         }
@@ -357,6 +380,11 @@ fn handle_frame_event(
         PortEvent::Frame(bytes) => bytes,
     };
 
+    // Checked around the forward() call, not exposed as part of its return
+    // type: blocking is a side effect of a loop-guard probe being handled
+    // successfully (see Switch::forward's doc comment), not an error or a
+    // delivery — this is the simplest way to still log the transition.
+    let was_blocked = switch.is_blocked(ingress);
     let decision = match EthernetFrame::parse(&bytes) {
         Ok(frame) => switch.forward(ingress, &frame, Instant::now()),
         Err(e) => {
@@ -364,6 +392,9 @@ fn handle_frame_event(
             return;
         }
     };
+    if !was_blocked && switch.is_blocked(ingress) {
+        eprintln!("{ingress:?}: loop detected — port blocked");
+    }
     match decision {
         Ok(deliveries) => {
             for Delivery { port, bytes } in deliveries {

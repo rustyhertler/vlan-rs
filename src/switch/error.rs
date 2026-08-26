@@ -19,4 +19,8 @@ pub enum SwitchError {
     /// something to silently accept.
     #[error("{port:?}: tagged frame on an access port")]
     TaggedFrameOnAccessPort { port: PortId },
+    /// `forward` was called with a port the loop guard has blocked — see
+    /// [`super::Switch::block_port`].
+    #[error("{0:?}: port is blocked by the loop guard")]
+    PortBlocked(PortId),
 }

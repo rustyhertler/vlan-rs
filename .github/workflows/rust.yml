@@ -47,6 +47,8 @@ jobs:
       run: sudo ./scripts/trunk-smoke-test.sh
     - name: config reload smoke test (phase 5)
       run: sudo ./scripts/config-reload-smoke-test.sh
+    - name: loop guard smoke test (stretch)
+      run: sudo ./scripts/loop-guard-smoke-test.sh
 
   fuzz:
     # Time-boxed, not full-time fuzzing — this is a smoke check that the

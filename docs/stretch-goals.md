@@ -1,6 +1,6 @@
 # vlan-rs — stretch goals
 
-Status: 3 of 6 done (as of 2026-08-26). This is the committed, durable version of the plan drafted interactively via the `blueprint` tool — see `docs/plan.md`'s own header for why that split exists.
+Status: 4 of 6 done (as of 2026-08-26). This is the committed, durable version of the plan drafted interactively via the `blueprint` tool — see `docs/plan.md`'s own header for why that split exists.
 
 All five planned phases (`docs/plan.md`) are done. `docs/plan.md`'s Stretch line names six unscheduled items: MAC aging, QinQ, loop guard, a scripted netns test harness, a small web dashboard, and `cargo-fuzz` on the parser. This doc sketches scope and effort for each and records what's actually been done.
 
@@ -20,9 +20,13 @@ Manually verified locally: 46M+ executions in 60 seconds, zero crashes, coverage
 
 `MacTable` entries now carry `last_seen: Instant`, stamped by `learn` — supplied by the caller (`Switch::forward` takes a `now: Instant` parameter) rather than read internally, so aging stays unit-testable without real time passing. `Switch::age_out(max_age, now)` evicts anything not relearned within `max_age`; `daemon.rs` runs it from a `tokio::time::interval` every 30s (`MAC_AGE_SWEEP_INTERVAL`), evicting entries older than 300s (`MAC_MAX_AGE`) — matching real switches' default. Aging is based on *source* activity only, same as real hardware — a lookup as a destination never refreshes an entry's clock, tested explicitly (`lookups_never_refresh_an_entrys_age`).
 
-### 4. Loop guard — not started
+### 4. Loop guard ✅ done
 
-vlan-rs has no STP; a real loop in the topology causes an unbounded broadcast storm. Full STP is out of scope by design — this would be a lighter self-loop-detection mechanism instead: a per-`Switch` nonce sent periodically out every port, and if a port ever receives its own switch's nonce back, that port gets blocked. Needs a new port state beyond today's `PortMode::{Access, Trunk}` and a decision about where "blocked" lives (in `PortMode` itself, or as switch-level state layered on top) — worth a dedicated planning round if picked up.
+vlan-rs has no STP; a real loop in the topology causes an unbounded broadcast storm. Full STP is out of scope by design — this is a lighter self-loop-detection mechanism instead: `daemon.rs` broadcasts a probe (`Switch::build_loop_probe`) out every port every `LOOP_PROBE_INTERVAL` (5s), carrying a per-`Switch` random `probe_id` (`Switch::with_probe_id`/`Switch::new`, keyed via `RandomState`, no `rand` dependency). Probes are recognized by a reserved `EtherType` (`0x88B7`, `src/switch/loop_guard.rs`) and handled before any VLAN/tag processing — like real switches special-case BPDUs — so a probe looping back through a trunk with no native VLAN isn't incorrectly rejected by that trunk's own ingress validation. If a port ever receives *this switch's own* `probe_id` back, `Switch::block_port` shuts that port down (no forwarding in or out) until the topology changes; `daemon.rs` logs the transition.
+
+**Scope limitation:** this only catches a *self*-loop — a cable or hub/bridge that connects two ports of the *same* switch instance back to each other, the way the smoke test below constructs one. A probe crossing to a neighboring vlan-rs switch is recognized as "not mine" and silently absorbed (`Ok(vec![])`) rather than flooded onward, so it never makes it back to its originator — meaning the most common storm-causing topology in practice, a loop formed by two switches and two links between them, is **not** detected by this mechanism. Closing that gap would need probes to be flooded rather than dropped when they're not recognized as this switch's own, which risks the probe outliving the loop that produced it; out of scope for this lightweight guard.
+
+"Blocked" landed as switch-level state layered on top of `PortMode` (a `PortEntry { mode, blocked }`), not a new `PortMode` variant — a port's VLAN configuration and its loop-guard status are orthogonal, and folding them together would have meant every `PortMode` match arm handling a blocked case that has nothing to do with VLANs. Recovery is via config reload (SIGHUP): `Switch::add_port` clears any prior block, so a topology fix plus a reload un-sticks a blocked port; there's no separate operator "unblock" command.
 
 ### 5. Small web dashboard — not started
 
@@ -39,12 +43,11 @@ Double-tagged frames (an outer S-VLAN tag, TPID `0x88a8`, around the existing si
 | CI harness | `smoke-tests` job passes on a real PR |
 | `cargo-fuzz` | `fuzz` job passes (60s bounded run, zero crashes) on a real PR |
 | MAC aging | `ages_out_stale_entries_but_keeps_fresh_ones`, `lookups_never_refresh_an_entrys_age` — a fake clock advanced past the threshold, no real time passing |
-| Loop guard | Bridge a switch's two trunk ports to each other and confirm no broadcast storm / the loop gets blocked |
+| Loop guard | `scripts/loop-guard-smoke-test.sh` (CI `smoke-tests` job): bridge a switch's two access ports directly to each other (a *self*-loop — see the scope limitation above) and confirm the log shows the loop detected and blocked, plus unit tests (`a_switchs_own_probe_looping_back_blocks_the_receiving_port`, `a_different_switchs_probe_does_not_block_anything`, `a_zero_padded_probe_is_still_recognized`, `two_switches_get_different_probe_ids`, `a_blocked_port_rejects_forward_calls`, `a_blocked_port_is_excluded_from_flooding`, `unicast_to_a_mac_learned_on_a_since_blocked_port_does_not_egress_it`, `unblock_port_restores_normal_forwarding`, `re_adding_a_port_clears_a_block`, `a_probe_touches_no_counters`) |
 | Web dashboard | Manual: curl the JSON endpoint and load the HTML page after generating traffic via a smoke test |
 | QinQ | Round-trip tests for double-tagged frames, mirroring phase 1's single-tag approach |
 
 ## Open questions
 
-- Loop guard, web dashboard, QinQ are still unscheduled — pick up if/when there's a concrete reason to want one.
-- Loop guard's "blocked port" state design isn't resolved here — needs its own planning round if picked up.
+- Web dashboard, QinQ are still unscheduled — pick up if/when there's a concrete reason to want one.
 - Web dashboard: hand-rolled or a real HTTP crate — the one place a new dependency would be a bigger philosophy shift than `thiserror`/`serde` were.

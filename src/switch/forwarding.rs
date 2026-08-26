@@ -1,5 +1,6 @@
 use super::counters::Counters;
 use super::error::SwitchError;
+use super::loop_guard;
 use super::mac_table::MacTable;
 use super::port::{PortId, PortMode, Vlan};
 use crate::frame::{Dot1qTag, EthernetFrame};
@@ -24,31 +25,68 @@ pub struct Delivery {
     pub bytes: Vec<u8>,
 }
 
-/// The switch core: per-VLAN MAC learning, access *and* trunk ports, zero
-/// I/O. Ports are just handles the caller assigns meaning to — actually
-/// moving bytes per the `Delivery` list `forward` returns is the caller's
-/// job.
-#[derive(Default)]
+/// A port's VLAN membership plus whether the loop guard has shut it down.
+/// Deliberately not folded into `PortMode` itself — VLAN membership and
+/// "is this port currently allowed to pass traffic" are orthogonal, and
+/// blocking would otherwise need to remember the prior mode to restore it.
+struct PortEntry {
+    mode: PortMode,
+    blocked: bool,
+}
+
+/// The switch core: per-VLAN MAC learning, access *and* trunk ports, a
+/// lightweight loop guard, zero I/O. Ports are just handles the caller
+/// assigns meaning to — actually moving bytes per the `Delivery` list
+/// `forward` returns is the caller's job.
 pub struct Switch {
-    ports: HashMap<PortId, PortMode>,
+    ports: HashMap<PortId, PortEntry>,
     mac_table: MacTable,
     port_counters: HashMap<PortId, Counters>,
     vlan_counters: HashMap<Vlan, Counters>,
+    probe_id: u64,
+}
+
+impl Default for Switch {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Switch {
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self::with_probe_id(loop_guard::random_probe_id())
     }
 
-    /// Registers `port` in `mode`. Calling this again for a `port` that's
-    /// already registered (e.g. to change its mode) purges any MAC-table
-    /// entries learned against it, so a stale route can't leak traffic
-    /// into whatever VLANs its new mode carries.
+    /// Like [`Switch::new`], but with an explicit loop-guard probe id
+    /// instead of a random one — for tests that need to construct a probe
+    /// frame and know in advance whether `forward` will recognize it as
+    /// this switch's own.
+    #[must_use]
+    pub fn with_probe_id(probe_id: u64) -> Self {
+        Switch {
+            ports: HashMap::new(),
+            mac_table: MacTable::default(),
+            port_counters: HashMap::new(),
+            vlan_counters: HashMap::new(),
+            probe_id,
+        }
+    }
+
+    /// Registers `port` in `mode`, unblocked. Calling this again for a
+    /// `port` that's already registered (e.g. to change its mode) purges
+    /// any MAC-table entries learned against it, so a stale route can't
+    /// leak traffic into whatever VLANs its new mode carries, and clears
+    /// any loop-guard block — a reconfigured port starts clean.
     pub fn add_port(&mut self, port: PortId, mode: PortMode) {
         self.mac_table.remove_port(port);
-        self.ports.insert(port, mode);
+        self.ports.insert(
+            port,
+            PortEntry {
+                mode,
+                blocked: false,
+            },
+        );
     }
 
     /// Deregisters `port` and purges its learned MAC-table entries and
@@ -66,6 +104,59 @@ impl Switch {
     /// many entries were evicted.
     pub fn age_out(&mut self, max_age: Duration, now: Instant) -> usize {
         self.mac_table.evict_older_than(max_age, now)
+    }
+
+    /// This switch instance's loop-guard probe identity. The caller is
+    /// expected to broadcast [`Switch::build_loop_probe`]'s bytes out
+    /// every port periodically; if one ever comes back on a port,
+    /// `forward` recognizes it (by this same id) and blocks that port.
+    #[must_use]
+    pub fn probe_id(&self) -> u64 {
+        self.probe_id
+    }
+
+    /// Builds this switch's loop-guard probe frame, ready to send
+    /// unmodified out every port regardless of VLAN/trunk mode — like a
+    /// real switch's BPDUs, probes bypass VLAN/tag processing entirely
+    /// (see `forward`'s doc comment) specifically so they aren't rejected
+    /// by, say, a trunk with no native VLAN.
+    #[must_use]
+    pub fn build_loop_probe(&self) -> Vec<u8> {
+        loop_guard::build_probe(self.probe_id)
+    }
+
+    /// Whether the loop guard has shut `port` down. A blocked port's
+    /// `forward` calls fail with `SwitchError::PortBlocked`, and it's
+    /// excluded as an egress target too — both flooded and unicast
+    /// traffic (see `encode_for_egress`) — but it still stays registered,
+    /// and still processes incoming loop-guard probes (should a future
+    /// version add automatic recovery once a loop clears).
+    #[must_use]
+    pub fn is_blocked(&self, port: PortId) -> bool {
+        self.ports.get(&port).is_some_and(|entry| entry.blocked)
+    }
+
+    /// Shuts `port` down: no traffic in or out until [`Switch::unblock_port`]
+    /// or a fresh [`Switch::add_port`] call. There's no automatic recovery
+    /// — this is a lightweight self-loop guard, not full spanning tree.
+    ///
+    /// Also purges `port`'s MAC-table entries, the same as
+    /// [`Switch::remove_port`] — otherwise a MAC learned on `port` before
+    /// it was blocked would keep drawing unicast traffic out through it
+    /// until the entry aged out on its own, up to [`Switch::age_out`]'s
+    /// `max_age` later, defeating "no traffic in or out" in the meantime.
+    pub fn block_port(&mut self, port: PortId) {
+        if let Some(entry) = self.ports.get_mut(&port) {
+            entry.blocked = true;
+        }
+        self.mac_table.remove_port(port);
+    }
+
+    /// Reverses [`Switch::block_port`].
+    pub fn unblock_port(&mut self, port: PortId) {
+        if let Some(entry) = self.ports.get_mut(&port) {
+            entry.blocked = false;
+        }
     }
 
     /// `port`'s frame/byte counters, or all-zero if `port` isn't registered
@@ -99,10 +190,18 @@ impl Switch {
     /// [`Switch::age_out`] — supplied by the caller rather than read
     /// internally, so aging stays testable without real time passing.
     ///
+    /// A loop-guard probe (see [`Switch::build_loop_probe`]) is recognized
+    /// by its `EtherType` alone and handled before any of the above: it's
+    /// never VLAN-resolved, learned, counted, or forwarded/flooded, the
+    /// same way a real switch's BPDUs bypass normal data-plane rules. If
+    /// its payload matches this switch's own probe id, `ingress` gets
+    /// [`Switch::block_port`]'ed; either way the call returns `Ok(vec![])`.
+    ///
     /// # Errors
     ///
     /// Returns [`SwitchError::UnknownPort`] if `ingress` was never
-    /// registered via [`Switch::add_port`], [`SwitchError::TaggedFrameOnAccessPort`]
+    /// registered via [`Switch::add_port`], [`SwitchError::PortBlocked`] if
+    /// the loop guard has shut `ingress` down, [`SwitchError::TaggedFrameOnAccessPort`]
     /// if a tagged frame arrived on an access port, or a trunk-specific
     /// error if `frame` doesn't resolve to a VLAN that trunk carries — see
     /// [`SwitchError`].
@@ -112,6 +211,19 @@ impl Switch {
         frame: &EthernetFrame,
         now: Instant,
     ) -> Result<Vec<Delivery>, SwitchError> {
+        if loop_guard::is_any_probe(frame) {
+            return self.handle_loop_probe(ingress, frame);
+        }
+
+        let entry = self
+            .ports
+            .get(&ingress)
+            .ok_or(SwitchError::UnknownPort(ingress))?;
+        if entry.blocked {
+            self.port_counters.entry(ingress).or_default().drops += 1;
+            return Err(SwitchError::PortBlocked(ingress));
+        }
+
         let vlan = match self.ingress_vlan(ingress, frame) {
             Ok(vlan) => vlan,
             Err(e) => {
@@ -163,17 +275,34 @@ impl Switch {
         Ok(deliveries)
     }
 
+    fn handle_loop_probe(
+        &mut self,
+        ingress: PortId,
+        frame: &EthernetFrame,
+    ) -> Result<Vec<Delivery>, SwitchError> {
+        if !self.ports.contains_key(&ingress) {
+            return Err(SwitchError::UnknownPort(ingress));
+        }
+        if loop_guard::is_own_probe(frame, self.probe_id) {
+            self.block_port(ingress);
+        }
+        Ok(Vec::new())
+    }
+
     /// Resolves the VLAN a frame arriving on `port` belongs to, per that
     /// port's mode. An access port ignores the wire entirely (it's always
     /// that one VLAN) but rejects a tagged frame outright rather than
     /// silently accepting one — a tag there means the two ends disagree
     /// about what kind of link this is.
+    ///
+    /// Whether `port` is loop-guard-blocked is `forward`'s concern, not
+    /// this one — checked once, up front, before this is ever called.
     fn ingress_vlan(&self, port: PortId, frame: &EthernetFrame) -> Result<Vlan, SwitchError> {
-        let mode = self
+        let entry = self
             .ports
             .get(&port)
             .ok_or(SwitchError::UnknownPort(port))?;
-        match (mode, &frame.tag) {
+        match (&entry.mode, &frame.tag) {
             (PortMode::Access { .. }, Some(_)) => {
                 Err(SwitchError::TaggedFrameOnAccessPort { port })
             }
@@ -204,10 +333,20 @@ impl Switch {
     /// 802.1Q-tagged otherwise. `None` means the frame couldn't be encoded,
     /// and is silently dropped for that one target rather than failing the
     /// whole `forward` call over it — deliberately unlogged, since the
-    /// switch core is zero-I/O by design (see the module docs) and both
-    /// ways this can actually happen are effectively unreachable today:
-    /// `port` not being registered can't happen (every caller of this
-    /// method derives `port` from `self.ports` itself), and the
+    /// switch core is zero-I/O by design (see the module docs).
+    ///
+    /// This is also where a loop-guard-blocked *egress* port gets filtered
+    /// out — the one place that covers both the flood path (where
+    /// `flood_targets` already excludes blocked ports, making this
+    /// redundant-but-harmless there) and the unicast path (where, absent
+    /// this check, a MAC learned on a port before it was blocked would
+    /// still draw unicast frames out through it). Centralizing it here
+    /// rather than duplicating it at each call site is what makes "no
+    /// traffic in or out" of a blocked port actually hold.
+    ///
+    /// The other two ways `None` can happen are effectively unreachable
+    /// today: `port` not being registered can't happen (every caller of
+    /// this method derives `port` from `self.ports` itself), and the
     /// untagged/`EtherType`-0x8100 ambiguity (see
     /// [`crate::frame::WriteError`]) needs a frame whose *inner* `EtherType`
     /// happens to be 0x8100 — only reachable via a QinQ-shaped frame, which
@@ -219,7 +358,11 @@ impl Switch {
         vlan: Vlan,
         frame: &EthernetFrame,
     ) -> Option<Delivery> {
-        let mode = self.ports.get(&port)?;
+        let egress = self.ports.get(&port)?;
+        if egress.blocked {
+            return None;
+        }
+        let mode = &egress.mode;
         let tag = match mode {
             PortMode::Access { .. } => None,
             PortMode::Trunk { native, .. } if *native == Some(vlan) => None,
@@ -247,7 +390,9 @@ impl Switch {
         let mut targets: Vec<PortId> = self
             .ports
             .iter()
-            .filter_map(|(&id, mode)| (id != exclude && mode.carries(vlan)).then_some(id))
+            .filter_map(|(&id, entry)| {
+                (id != exclude && !entry.blocked && entry.mode.carries(vlan)).then_some(id)
+            })
             .collect();
         targets.sort_by_key(|p| p.0);
         targets
