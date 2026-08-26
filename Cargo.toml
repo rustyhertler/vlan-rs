@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync"] }
+tun-rs = { version = "2.8.8", features = ["async"] }
 
 [dev-dependencies]
 etherparse = "0.21.0"
