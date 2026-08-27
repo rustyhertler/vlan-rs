@@ -200,6 +200,40 @@ is the operator's explicit, informed choice, documented in
   802.1Q quirks, real NIC/driver behavior, actual link timing). Not part
   of CI — an escalation, most useful around trunk-port interop.
 
+## Bench testing on real hardware
+
+`scripts/bench-port-setup.sh <physical-iface> <tap-name>` turns the
+hardware-in-the-loop escalation above into something runnable: it
+bridges a real physical NIC to a vlan-rs TAP port, so a real cable — not
+a netns/veth stand-in — carries the traffic. vlan-rs only knows how to
+open a TAP device (`src/io/tap.rs`); a default Linux bridge doesn't
+interpret 802.1Q tags, so it works for both access and trunk ports
+without vlan-rs losing its status as the only thing that understands
+VLANs. Run it by hand, once per physical port, after vlan-rs is already
+running on that box.
+
+A topology that exercises everything above with two or three boxes:
+
+- Two boxes each run `vlan-rs`, cabled directly to each other on a
+  **trunk port** (same VLAN allowed on both ends). Each also has an
+  **access port** cabled to a real client. Ping between the clients
+  across the real trunk is the core "this actually works" proof.
+- A third box (or a third NIC) as a second client on a different VLAN
+  proves isolation the same way the unit tests do, but over copper.
+- Short-cabling two ports on the *same* box is a real self-loop — watch
+  `daemon.rs`'s log block it live.
+- Cabling a *second* link between the two switch boxes (in addition to
+  the trunk) is a real cross-switch loop — the one topology the loop
+  guard's scope limitation (above) says it won't catch. Confirming that
+  is a legitimate test, but it's an actual unbounded broadcast storm on
+  real gear: keep it brief, isolated, and ready to unplug.
+
+An alternative to the bridge — opening a `macvtap` interface in passthru
+mode directly, no bridge in between — is architecturally cleaner and
+looks plausible from `tun-rs`'s API (`AsyncDevice::from_fd` wraps an
+already-open fd with no TUN-specific ioctls at construction), but isn't
+implemented or verified against real hardware yet.
+
 ## Verification
 
 | Capability | How we know it works |
