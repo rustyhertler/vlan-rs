@@ -49,6 +49,8 @@ jobs:
       run: sudo ./scripts/config-reload-smoke-test.sh
     - name: loop guard smoke test (stretch)
       run: sudo ./scripts/loop-guard-smoke-test.sh
+    - name: dashboard smoke test (stretch)
+      run: sudo ./scripts/dashboard-smoke-test.sh
 
   fuzz:
     # Time-boxed, not full-time fuzzing — this is a smoke check that the
