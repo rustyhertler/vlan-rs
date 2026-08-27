@@ -120,7 +120,7 @@ fi
 # from the actual port identifiers logged rather than the line count.
 blocked_ports="$(grep -o '^PortId([0-9]*): loop detected' "$LOG_FILE" | sort -u | wc -l)"
 
-# The acceptance criterion (docs/stretch-goals.md) is "no broadcast storm",
+# The acceptance criterion (docs/design.md) is "no broadcast storm",
 # not just "a log line appeared" — confirm traffic has actually plateaued,
 # not merely that detection fired once. Port counters can't tell us this:
 # a loop-guard probe never touches them even when it's *not* recognized
