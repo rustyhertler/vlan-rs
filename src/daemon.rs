@@ -316,7 +316,18 @@ pub async fn run(
     if let Some(addr) = dashboard_addr {
         let listener = TcpListener::bind(addr).await?;
         eprintln!("dashboard: listening on http://{addr}");
-        tokio::spawn(dashboard::serve(listener, counters_tx.clone()));
+        // dashboard::serve only returns on a fatal accept() error (fd
+        // exhaustion, say) — every other spawned task in this file logs
+        // its own failure, so this one does too rather than silently
+        // going dark with no trace of why the dashboard stopped.
+        tokio::spawn({
+            let counters_tx = counters_tx.clone();
+            async move {
+                if let Err(e) = dashboard::serve(listener, counters_tx).await {
+                    eprintln!("dashboard: stopped: {e}");
+                }
+            }
+        });
     }
 
     loop {

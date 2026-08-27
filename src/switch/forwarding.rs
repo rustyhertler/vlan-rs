@@ -145,6 +145,18 @@ impl Switch {
         self.ports.get(&port).map(|entry| entry.mode.clone())
     }
 
+    /// `port`'s counters, mode, and loop-guard block status together —
+    /// `None` if it isn't registered. Equivalent to combining
+    /// [`Switch::port_counters`], [`Switch::is_blocked`], and
+    /// [`Switch::port_mode`], but in one lookup against `self.ports`
+    /// instead of two, for a caller (the dashboard) that always wants
+    /// all three per port anyway.
+    #[must_use]
+    pub fn port_snapshot(&self, port: PortId) -> Option<(Counters, bool, PortMode)> {
+        let entry = self.ports.get(&port)?;
+        Some((self.port_counters(port), entry.blocked, entry.mode.clone()))
+    }
+
     /// Whether the loop guard has shut `port` down. A blocked port's
     /// `forward` calls fail with `SwitchError::PortBlocked`, and it's
     /// excluded as an egress target too — both flooded and unicast

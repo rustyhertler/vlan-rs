@@ -82,6 +82,14 @@ function describeMode(mode) {
   return `trunk, native ${native}, allowed [${mode.allowed.join(", ")}]`;
 }
 
+// Counters arrive as JSON strings, not bare numbers — a u64 can exceed
+// 2^53, past which JS's own f64-backed numbers silently lose precision.
+// BigInt is exact regardless of magnitude, and still formats with the
+// same thousands separators Number.toLocaleString() would give.
+function fmtCount(str) {
+  return BigInt(str).toLocaleString();
+}
+
 function renderPorts(ports) {
   const tbody = document.getElementById("ports");
   if (ports.length === 0) {
@@ -93,11 +101,11 @@ function renderPorts(ports) {
       <td>PortId(${p.port})</td>
       <td>${describeMode(p.mode)}</td>
       <td><span class="badge ${p.blocked ? "blocked" : "ok"}">${p.blocked ? "blocked" : "ok"}</span></td>
-      <td>${p.frames_in.toLocaleString()}</td>
-      <td>${p.bytes_in.toLocaleString()}</td>
-      <td>${p.frames_out.toLocaleString()}</td>
-      <td>${p.bytes_out.toLocaleString()}</td>
-      <td>${p.drops.toLocaleString()}</td>
+      <td>${fmtCount(p.frames_in)}</td>
+      <td>${fmtCount(p.bytes_in)}</td>
+      <td>${fmtCount(p.frames_out)}</td>
+      <td>${fmtCount(p.bytes_out)}</td>
+      <td>${fmtCount(p.drops)}</td>
     </tr>
   `).join("");
 }
@@ -111,10 +119,10 @@ function renderVlans(vlans) {
   tbody.innerHTML = vlans.map(v => `
     <tr>
       <td>${v.vlan}</td>
-      <td>${v.frames_in.toLocaleString()}</td>
-      <td>${v.bytes_in.toLocaleString()}</td>
-      <td>${v.frames_out.toLocaleString()}</td>
-      <td>${v.bytes_out.toLocaleString()}</td>
+      <td>${fmtCount(v.frames_in)}</td>
+      <td>${fmtCount(v.bytes_in)}</td>
+      <td>${fmtCount(v.frames_out)}</td>
+      <td>${fmtCount(v.bytes_out)}</td>
     </tr>
   `).join("");
 }

@@ -27,11 +27,28 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::switch::{Counters, PortMode, Switch};
 
-/// How long a connection gets to send its request line before it's
+/// How long a connection gets to send its full request line before it's
 /// abandoned. Bounds a stalled/slow client to one lightweight task
 /// instead of an indefinite hang — there's no keep-alive here for a
 /// client to legitimately hold a connection open across.
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Upper bound on how much of a request this server will buffer looking
+/// for the request line's terminating `\n`. TCP delivers a write as
+/// however many reads it delivers as — a single `read()` isn't
+/// guaranteed to contain a whole line — so this accumulates across reads
+/// rather than assuming the first one has it all; a client that never
+/// sends a `\n` (or sends an absurdly long line) gets cut off here
+/// rather than growing this buffer without limit.
+const MAX_REQUEST_LINE_LEN: usize = 8192;
+
+/// After responding, how long (and how much) this server will keep
+/// reading and discarding whatever the client sends, before finally
+/// closing the connection. Draining first — rather than closing straight
+/// away — is what keeps an unread request body from producing a TCP RST
+/// on the client's end instead of a clean close.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+const DRAIN_MAX_BYTES: usize = 64 * 1024;
 
 const INDEX_HTML: &str = include_str!("dashboard/index.html");
 
@@ -65,15 +82,10 @@ async fn handle_connection(
     mut stream: TcpStream,
     counters_tx: mpsc::UnboundedSender<oneshot::Sender<String>>,
 ) -> io::Result<()> {
-    let mut buf = [0u8; 4096];
-    let n = tokio::time::timeout(REQUEST_READ_TIMEOUT, stream.read(&mut buf))
+    let line = tokio::time::timeout(REQUEST_READ_TIMEOUT, read_request_line(&mut stream))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "request timed out"))??;
 
-    // Only the request line matters — headers and any body are ignored
-    // outright. GET requests from a browser or curl fit in one read.
-    let line = buf[..n].split(|&b| b == b'\n').next().unwrap_or(&[]);
-    let line = String::from_utf8_lossy(line);
     let mut parts = line.split_whitespace();
     let (method, path) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
 
@@ -97,7 +109,53 @@ async fn handle_connection(
         body.len()
     );
     stream.write_all(response.as_bytes()).await?;
-    stream.shutdown().await
+    stream.shutdown().await?;
+    // Only after: closing the socket while the kernel still has bytes
+    // buffered for it (an unread request body, most commonly) commonly
+    // produces a TCP RST instead of a clean FIN — harmless to us since
+    // the response already went out, but it can surface on the client's
+    // end as a spurious "connection reset" for something as ordinary as
+    // a POST with a body this server never reads.
+    drain_request_body(&mut stream).await;
+    Ok(())
+}
+
+/// Reads from `stream` until a full line (through `\n`) is buffered, or
+/// [`MAX_REQUEST_LINE_LEN`] is reached. Only the request line is ever
+/// used — headers and any body are ignored outright, which is why this
+/// only needs to find one `\n`, not parse `Content-Length` or frame a
+/// body at all.
+async fn read_request_line(stream: &mut TcpStream) -> io::Result<String> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 512];
+    while !buf.contains(&b'\n') && buf.len() < MAX_REQUEST_LINE_LEN {
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            break; // client closed before sending a full line
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    let line = buf.split(|&b| b == b'\n').next().unwrap_or(&[]);
+    Ok(String::from_utf8_lossy(line).into_owned())
+}
+
+/// Best-effort: reads and discards whatever the client sends after the
+/// response has already gone out, up to [`DRAIN_TIMEOUT`] /
+/// [`DRAIN_MAX_BYTES`] — see the call site for why.
+async fn drain_request_body(stream: &mut TcpStream) {
+    let mut buf = [0u8; 4096];
+    let mut drained = 0usize;
+    let deadline = tokio::time::Instant::now() + DRAIN_TIMEOUT;
+    while drained < DRAIN_MAX_BYTES {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, stream.read(&mut buf)).await {
+            Ok(Ok(n)) if n > 0 => drained += n,
+            _ => break, // EOF, a read error, or the drain timeout — stop either way
+        }
+    }
 }
 
 async fn request_counters_json(
@@ -119,10 +177,16 @@ fn server_error() -> (&'static str, &'static str, String) {
 /// Renders `switch`'s current per-port and per-VLAN counters (plus each
 /// port's mode and loop-guard block state) as JSON — the same data
 /// `SIGUSR1`'s `dump_counters` prints to stderr, shaped for a browser
-/// instead of a log. Every field is numeric, boolean, or one of a small
-/// fixed set of string literals this function itself chooses (`"access"`,
-/// `"trunk"`), and no free-text ever flows in here — hand-rolled
-/// formatting needs no escaping to stay safe.
+/// instead of a log. Every field is a bare number, a bare boolean, or one
+/// of a small fixed set of string literals this function itself chooses
+/// (`"access"`, `"trunk"`) — except the `u64` counters themselves
+/// (`frames_in`/`bytes_in`/`frames_out`/`bytes_out`/`drops`), which are
+/// quoted as strings: JS numbers are `f64`, so a bare JSON integer past
+/// `2^53` (~9 petabytes of traffic — reachable on a long-running switch)
+/// would silently lose precision the moment a browser calls
+/// `JSON.parse`; `index.html` reads them back with `BigInt`. No free-text
+/// ever flows into any of this — hand-rolled formatting needs no
+/// escaping to stay safe.
 ///
 /// Lists every *registered* port (`Switch::port_ids`), not just ones
 /// `all_port_counters` already has an entry for — otherwise a
@@ -130,15 +194,14 @@ fn server_error() -> (&'static str, &'static str, String) {
 /// the dashboard instead of showing up as zero traffic.
 #[must_use]
 pub fn render_counters_json(switch: &Switch) -> String {
+    // port_snapshot combines what would otherwise be three separate
+    // lookups (port_counters, is_blocked, port_mode) per port into one.
     let mut ports: Vec<_> = switch
         .port_ids()
-        .map(|p| {
-            (
-                p,
-                switch.port_counters(p),
-                switch.is_blocked(p),
-                switch.port_mode(p),
-            )
+        .filter_map(|p| {
+            switch
+                .port_snapshot(p)
+                .map(|(c, blocked, mode)| (p, c, blocked, mode))
         })
         .collect();
     ports.sort_by_key(|(p, ..)| p.0);
@@ -151,7 +214,7 @@ pub fn render_counters_json(switch: &Switch) -> String {
         if i > 0 {
             out.push(',');
         }
-        write_port(&mut out, port.0, *blocked, mode.as_ref(), c);
+        write_port(&mut out, port.0, *blocked, mode, c);
     }
     out.push_str(r#"],"vlans":["#);
     for (i, (vlan, c)) in vlans.iter().enumerate() {
@@ -164,7 +227,7 @@ pub fn render_counters_json(switch: &Switch) -> String {
     out
 }
 
-fn write_port(out: &mut String, port: u32, blocked: bool, mode: Option<&PortMode>, c: &Counters) {
+fn write_port(out: &mut String, port: u32, blocked: bool, mode: &PortMode, c: &Counters) {
     // write! on a String only fails on a formatting bug (never allocation
     // in practice here), so this mirrors loop_guard::build_probe's
     // `let _ =` honesty rather than pretending it can't fail.
@@ -172,21 +235,17 @@ fn write_port(out: &mut String, port: u32, blocked: bool, mode: Option<&PortMode
     write_mode(out, mode);
     let _ = write!(
         out,
-        r#","frames_in":{},"bytes_in":{},"frames_out":{},"bytes_out":{},"drops":{}}}"#,
+        r#","frames_in":"{}","bytes_in":"{}","frames_out":"{}","bytes_out":"{}","drops":"{}"}}"#,
         c.frames_in, c.bytes_in, c.frames_out, c.bytes_out, c.drops
     );
 }
 
-fn write_mode(out: &mut String, mode: Option<&PortMode>) {
+fn write_mode(out: &mut String, mode: &PortMode) {
     match mode {
-        // Every caller derives `port` from the switch's own port set, so
-        // `None` (an unregistered port) can't actually happen — but a
-        // valid-JSON `null` is a cheap, honest fallback over unwrapping.
-        None => out.push_str("null"),
-        Some(PortMode::Access { vlan }) => {
+        PortMode::Access { vlan } => {
             let _ = write!(out, r#"{{"kind":"access","vlan":{vlan}}}"#);
         }
-        Some(PortMode::Trunk { native, allowed }) => {
+        PortMode::Trunk { native, allowed } => {
             let mut allowed: Vec<_> = allowed.iter().collect();
             allowed.sort_unstable();
             let _ = write!(out, r#"{{"kind":"trunk","native":"#);
@@ -211,7 +270,7 @@ fn write_mode(out: &mut String, mode: Option<&PortMode>) {
 fn write_vlan(out: &mut String, vlan: u16, c: &Counters) {
     let _ = write!(
         out,
-        r#"{{"vlan":{vlan},"frames_in":{},"bytes_in":{},"frames_out":{},"bytes_out":{}}}"#,
+        r#"{{"vlan":{vlan},"frames_in":"{}","bytes_in":"{}","frames_out":"{}","bytes_out":"{}"}}"#,
         c.frames_in, c.bytes_in, c.frames_out, c.bytes_out
     );
 }
