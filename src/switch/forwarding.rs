@@ -125,6 +125,38 @@ impl Switch {
         loop_guard::build_probe(self.probe_id)
     }
 
+    /// Every currently-registered port, regardless of whether it's ever
+    /// carried traffic — unlike [`Switch::all_port_counters`], which only
+    /// covers ports [`Switch::forward`] has actually touched. A caller
+    /// that wants to describe *every* port (the dashboard, listing a
+    /// freshly-added or blocked-but-idle port as "0 traffic" rather than
+    /// making it vanish) should iterate this, not
+    /// `all_port_counters`. Order not guaranteed.
+    pub fn port_ids(&self) -> impl Iterator<Item = PortId> + '_ {
+        self.ports.keys().copied()
+    }
+
+    /// `port`'s current VLAN mode, or `None` if it isn't registered.
+    /// Read-only mirror of what [`Switch::add_port`] set it to — for a
+    /// caller (the dashboard) that wants to describe a port without
+    /// otherwise touching switch state.
+    #[must_use]
+    pub fn port_mode(&self, port: PortId) -> Option<PortMode> {
+        self.ports.get(&port).map(|entry| entry.mode.clone())
+    }
+
+    /// `port`'s counters, mode, and loop-guard block status together —
+    /// `None` if it isn't registered. Equivalent to combining
+    /// [`Switch::port_counters`], [`Switch::is_blocked`], and
+    /// [`Switch::port_mode`], but in one lookup against `self.ports`
+    /// instead of two, for a caller (the dashboard) that always wants
+    /// all three per port anyway.
+    #[must_use]
+    pub fn port_snapshot(&self, port: PortId) -> Option<(Counters, bool, PortMode)> {
+        let entry = self.ports.get(&port)?;
+        Some((self.port_counters(port), entry.blocked, entry.mode.clone()))
+    }
+
     /// Whether the loop guard has shut `port` down. A blocked port's
     /// `forward` calls fail with `SwitchError::PortBlocked`, and it's
     /// excluded as an egress target too — both flooded and unicast
@@ -166,8 +198,8 @@ impl Switch {
         self.port_counters.get(&port).copied().unwrap_or_default()
     }
 
-    /// Every port with at least one counter update, most-recently-touched
-    /// order not guaranteed.
+    /// Every port with at least one counter update — not every registered
+    /// port; see [`Switch::port_ids`] for that. Order not guaranteed.
     pub fn all_port_counters(&self) -> impl Iterator<Item = (PortId, Counters)> + '_ {
         self.port_counters.iter().map(|(&p, &c)| (p, c))
     }
