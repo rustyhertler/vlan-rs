@@ -151,14 +151,14 @@ through an `mpsc` queue into that loop:
 sequenceDiagram
     participant Browser
     participant Conn as dashboard::serve<br/>(per-connection task)
-    participant Loop as daemon::run<br/>select! loop
+    participant RunLoop as daemon::run<br/>select! loop
     participant Switch
 
     Browser->>Conn: GET /api/counters
-    Conn->>Loop: oneshot reply channel (String) via mpsc
-    Loop->>Switch: counters + mode + blocked, per port
-    Loop->>Loop: dashboard::render_counters_json(&switch)
-    Loop-->>Conn: JSON string (oneshot reply)
+    Conn->>RunLoop: oneshot reply channel (String) via mpsc
+    RunLoop->>Switch: counters + mode + blocked, per port
+    RunLoop->>RunLoop: dashboard::render_counters_json(&switch)
+    RunLoop-->>Conn: JSON string (oneshot reply)
     Conn-->>Browser: 200 application/json
 ```
 
