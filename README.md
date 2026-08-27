@@ -15,7 +15,7 @@ Roadmap:
 4. Trunk ports (tag/untag, allowed-VLAN lists, native VLAN, two switches over a trunk) ✅
 5. Config & CLI (TOML topology, live reconfig, counters) ✅
 
-Stretch: scripted netns test harness in CI ✅, `cargo-fuzz` on the parser ✅, MAC aging ✅, loop guard ✅ (self-loops only — see `docs/stretch-goals.md`). Unscheduled: QinQ, small web dashboard.
+Stretch: scripted netns test harness in CI ✅, `cargo-fuzz` on the parser ✅, MAC aging ✅, loop guard ✅ (self-loops only — see `docs/stretch-goals.md`), small web dashboard ✅ (`--dashboard <bind-addr>`). Unscheduled: QinQ.
 
 Full design and rationale: [`docs/plan.md`](docs/plan.md), [`docs/stretch-goals.md`](docs/stretch-goals.md).
 
@@ -37,6 +37,12 @@ Two ways to specify ports:
 - `--config <path.toml>` — see `scripts/config-reload-smoke-test.sh` for an example file. While running:
   `kill -HUP <pid>` reloads the file (tears down and rebuilds every port to match it);
   `kill -USR1 <pid>` dumps per-port/VLAN counters to stderr.
+
+Add `--dashboard <bind-addr>` (before the port specs or `--config`) for a live, auto-refreshing HTML view of the
+same counters plus each port's mode, e.g. `vlan-rs --dashboard 127.0.0.1:8080 tap0:10`, then open
+`http://127.0.0.1:8080/` or `curl http://127.0.0.1:8080/api/counters`. No auth — same trust model as `SIGUSR1`
+(anyone who can already signal the process can already dump these counters), so don't bind beyond `127.0.0.1` on
+an untrusted network.
 
 Fuzzing the frame parser (needs nightly + `cargo install cargo-fuzz`):
 

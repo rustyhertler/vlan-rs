@@ -1,14 +1,17 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::config::Config;
+use crate::dashboard;
 use crate::frame::EthernetFrame;
 use crate::io::TapPort;
 use crate::switch::{Delivery, PortId, PortMode, Switch, Vlan};
@@ -249,9 +252,9 @@ fn deliver(handles: &HashMap<PortId, PortHandle>, port: PortId, bytes: Vec<u8>) 
 ///
 /// Returns an error if `path` can't be read or doesn't parse as a valid
 /// topology, or anything [`run`] can return.
-pub async fn run_from_config(path: PathBuf) -> io::Result<()> {
+pub async fn run_from_config(path: PathBuf, dashboard_addr: Option<SocketAddr>) -> io::Result<()> {
     let specs = Config::load(&path)?.into_specs()?;
-    run(specs, Some(path)).await
+    run(specs, Some(path), dashboard_addr).await
 }
 
 /// Opens a TAP device per `(name, mode)` pair and runs the switch's
@@ -268,12 +271,29 @@ pub async fn run_from_config(path: PathBuf) -> io::Result<()> {
 /// unchanged ports too. `SIGUSR1` dumps per-port and per-VLAN counters to
 /// stderr.
 ///
+/// `dashboard_addr`, if given, binds a read-only HTTP counters page
+/// (`dashboard::serve`) alongside the forwarding loop. That listener task
+/// never holds a reference to `switch` — a request for `/api/counters`
+/// hands a reply channel through `counters_tx` into this function's own
+/// `select!` loop instead, the one place allowed to touch `switch` (see
+/// above). `counters_tx` is created unconditionally and kept alive for
+/// this function's whole lifetime; if `dashboard_addr` is `None`, it's
+/// simply never cloned into a spawned listener, so the `counters_rx.recv()`
+/// arm below legitimately never resolves instead of needing an
+/// `Option`-guarded branch. A reload swapping `switch` out from under it
+/// is invisible to the dashboard for the same reason — the next request
+/// just sees the post-reload state.
+///
 /// # Errors
 ///
 /// Returns an error if a TAP device can't be opened (most commonly a
-/// missing `CAP_NET_ADMIN`) or if there are too many ports to fit a `u32`
-/// port index.
-pub async fn run(specs: Vec<(String, PortMode)>, reload_path: Option<PathBuf>) -> io::Result<()> {
+/// missing `CAP_NET_ADMIN`), if there are too many ports to fit a `u32`
+/// port index, or if `dashboard_addr` can't be bound.
+pub async fn run(
+    specs: Vec<(String, PortMode)>,
+    reload_path: Option<PathBuf>,
+    dashboard_addr: Option<SocketAddr>,
+) -> io::Result<()> {
     let mut switch = Switch::new();
     let mut handles: HashMap<PortId, PortHandle> = HashMap::new();
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<(PortId, PortEvent)>();
@@ -291,6 +311,13 @@ pub async fn run(specs: Vec<(String, PortMode)>, reload_path: Option<PathBuf>) -
     age_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut loop_probe = tokio::time::interval(LOOP_PROBE_INTERVAL);
     loop_probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    let (counters_tx, mut counters_rx) = mpsc::unbounded_channel::<oneshot::Sender<String>>();
+    if let Some(addr) = dashboard_addr {
+        let listener = TcpListener::bind(addr).await?;
+        eprintln!("dashboard: listening on http://{addr}");
+        tokio::spawn(dashboard::serve(listener, counters_tx.clone()));
+    }
 
     loop {
         tokio::select! {
@@ -331,6 +358,13 @@ pub async fn run(specs: Vec<(String, PortMode)>, reload_path: Option<PathBuf>) -
                         eprintln!("{port:?}: outbound queue full, dropped loop-guard probe");
                     }
                 }
+            }
+            Some(reply_tx) = counters_rx.recv() => {
+                // The reply side of a dashboard request for /api/counters
+                // (see this function's doc comment) — a dropped receiver
+                // just means the client disconnected before this reply
+                // was ready, not this loop's problem.
+                let _ = reply_tx.send(dashboard::render_counters_json(&switch));
             }
         }
     }
