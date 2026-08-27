@@ -123,7 +123,10 @@ ports_json="$(sed -n 's/.*"ports":\[\(.*\)\],"vlans".*/\1/p' <<<"$counters")"
 # actually relayed out the other, not just recognized as a probe or
 # dropped, and that the dashboard's oneshot/mpsc path to the live Switch
 # is reporting real, current state rather than a fixed/stale snapshot.
-frames_out_values="$(grep -o '"frames_out":[0-9]*' <<<"$ports_json" | cut -d: -f2)"
+# Counters are quoted JSON strings, not bare numbers (dashboard.rs quotes
+# u64 fields so a browser's JSON.parse can't silently round one past
+# 2^53) — match the quotes, not just digits.
+frames_out_values="$(grep -o '"frames_out":"[0-9]*"' <<<"$ports_json" | grep -o '[0-9]*')"
 nonzero_count="$(grep -c -v '^0$' <<<"$frames_out_values" || true)"
 if [ "$nonzero_count" -lt 2 ]; then
   echo "FAIL: expected both ports to show frames_out > 0, got: $frames_out_values" >&2
