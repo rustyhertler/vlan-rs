@@ -67,17 +67,63 @@ fn rejects_an_unknown_mode() {
 
 #[test]
 fn rejects_an_out_of_range_vlan() {
+    for vid in [0u16, 4095, 4096] {
+        let toml = format!(
+            r#"
+                [[port]]
+                name = "tap0"
+                mode = "access"
+                vlan = {vid}
+            "#
+        );
+        let err = Config::from_toml_str(&toml)
+            .unwrap()
+            .into_specs()
+            .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidPort { .. }),
+            "expected InvalidPort for vlan {vid}, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn rejects_an_out_of_range_trunk_vlan() {
     let toml = r#"
         [[port]]
         name = "tap0"
-        mode = "access"
-        vlan = 4095
+        mode = "trunk"
+        native = 4096
+        allowed = [10]
     "#;
     let err = Config::from_toml_str(toml)
         .unwrap()
         .into_specs()
         .unwrap_err();
     assert!(matches!(err, ConfigError::InvalidPort { .. }));
+}
+
+#[test]
+fn accepts_assignable_vlan_id_bounds() {
+    let toml = r#"
+        [[port]]
+        name = "tap0"
+        mode = "access"
+        vlan = 1
+
+        [[port]]
+        name = "tap1"
+        mode = "access"
+        vlan = 4094
+    "#;
+    let specs = Config::from_toml_str(toml).unwrap().into_specs().unwrap();
+    assert_eq!(
+        specs,
+        vec![
+            ("tap0".to_owned(), PortMode::access(1).unwrap()),
+            ("tap1".to_owned(), PortMode::access(4094).unwrap()),
+        ]
+    );
 }
 
 #[test]

@@ -75,8 +75,22 @@ fn rejects_a_non_numeric_vlan_id() {
 fn rejects_an_out_of_range_vlan_id() {
     assert!(parse_port_specs(args(&["tap0:0"])).is_err());
     assert!(parse_port_specs(args(&["tap0:4095"])).is_err());
+    assert!(parse_port_specs(args(&["tap0:4096"])).is_err());
     assert!(parse_port_specs(args(&["tap0:trunk:0:10"])).is_err());
     assert!(parse_port_specs(args(&["tap0:trunk:-:0,10"])).is_err());
+    assert!(parse_port_specs(args(&["tap0:trunk:4096:10"])).is_err());
+    assert!(parse_port_specs(args(&["tap0:trunk:-:4096"])).is_err());
+}
+
+#[test]
+fn accepts_assignable_vlan_id_bounds() {
+    assert_eq!(
+        parse_port_specs(args(&["tap0:1", "tap1:4094"])).unwrap(),
+        vec![
+            ("tap0".to_owned(), PortMode::access(1).unwrap()),
+            ("tap1".to_owned(), PortMode::access(4094).unwrap()),
+        ]
+    );
 }
 
 #[test]

@@ -40,7 +40,7 @@ impl From<InvalidVlan> for PortModeError {
 }
 
 const fn is_assignable(vlan: Vlan) -> bool {
-    vlan != 0 && vlan != 4095
+    matches!(vlan, 1..=4094)
 }
 
 /// How a port participates in VLANs.
